@@ -2,9 +2,9 @@
 
 | 项 | 值 |
 | :--- | :--- |
-| 文档版本 | 1.0 |
-| 对应版本 | git `bc005ff` |
-| 配套验收 | [UAT.md](UAT.md)（24/24 PASS） |
+| 文档版本 | 1.1 |
+| 对应版本 | 本地工作树（Workpack A ~ E；未推送远端） |
+| 配套验收 | [UAT.md](UAT.md)（30/30 PASS） |
 | 原则 | 本文列出的内容**不构成已完成能力**；不要用 UAT 的通过项推断它们可用 |
 
 状态口径：
@@ -20,21 +20,21 @@
 
 | ID | 能力 | 状态 | 影响 | 补齐所需 | 规模 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| G-01 | DSH `FleetSubagentProvider` | 未实现 | 子 Agent 不会自动获得 Branch/Workspace | 改 `@dsh-layerfs/host`：provider + 生命周期 + env | M |
-| G-02 | `ensureFleetDaemon` 随 `dsh web` 启停 | 未实现 | 需手动启动 `fleet` | `ctx.effect` 包一层守护进程 | S |
-| G-03 | DSH GUI 中的舰队可视化 | 部分实现 | trace 可被 Collector 读，但界面看不到 | 真实 Session + `bindings.json` + Provider | M |
+| G-01 | DSH `FleetSubagentProvider` | 已实现未验证 | provider 已写好并按默认 `spawn` 之外的方式注册；默认 preset 仍用 `spawn` | 重启 DSH、把 `tool-subagent` 指向 `fleet` 并实测一次派生/Stop | M |
+| G-02 | `ensureFleetDaemon` 随 `dsh web` 启停 | 部分实现 | 环境变量与 `DSH_LAYERFS_FLEET` 已注入，但进程仍不随 `dsh web` 启停 | `ctx.effect` 包一层守护进程 | S |
+| G-03 | DSH GUI 中的舰队可视化 | 部分实现 | trace 可被 Collector 读；provider 已登记 `childSessionId -> {root, name, branch}`，界面仍未实测 | 真实 Session + `bindings.json` + Provider | M |
 | G-04 | Live / Docker 模式 | 已实现未验证 | 只保证模拟器行为 | 在 live 项目重跑 UAT + daemon 容量测试 | M |
-| G-05 | LLM 子 Agent worker | 未实现 | worker 只能跑 shell 命令 | Provider 派生 DSH subagent，结果回传 | L |
-| G-06 | Pipeline 拓扑 | 未实现 | 无阶段/回滚/重试 | 新增 `topologies/pipeline.gleam` + 测试 | M |
-| G-07 | FactBlackboard | 未实现 | 跨分支事实/踩坑不共享 | 新增 actor + worker 注入 + 测试 | M |
+| G-05 | LLM 子 Agent worker | 部分实现 | 内核 worker 仍只能跑 shell 命令；`fleet-provider.js` 已能把 DSH 的 subagent 隔离到独立 Branch | 内核侧 LLM worker 循环 + 结果回传 | L |
+| G-06 | Pipeline 拓扑 | 已实现 | 阶段门禁、按阶段回滚重试、耗尽干净停止 | —（UAT-25..28 守护） | M |
+| G-07 | FactBlackboard | 已实现（未自动注入 worker） | 跨分支事实/踩坑/接口锁已可共享；worker 命令前缀仍是手工拼 | 把快照注入 `worker_runner` 的 exec 前缀 | M |
 | G-08 | HTTP / MCP API | 未实现 | 只能 CLI/进程内调用 | Mist/Wisp server + 鉴权 | M |
 | G-09 | Rustler NIF / Unix Socket 直连 | 未实现 | 多一层 Node 桥与 JSON 开销 | 原生绑定或 socket 协议 | L |
 | G-10 | 跨进程全局槽位记账 | 部分实现 | 多控制面共享 Sandbox 可能超卖 | 全局租约表/daemon 侧强制 | M |
 | G-11 | CPU 级抢占 | 部分实现 | 输家的远端 shell 可能继续跑 | 暴露进程句柄（operator/daemon API） | M |
 | G-12 | 自动选优 / 评分 | 设计外（当前） | “哪个更好”由主 Agent/用户判断 | 显式指标 + `BestOf`，仍不自动发布 | M |
 | G-13 | 服务端强制验证门禁 | 未实现 | 直接调 SDK 可绕过内核发布 | daemon policy / 签名 receipt | L |
-| G-14 | 决策包持久化 / 审计回执 | 未实现 | 决策只在 stdout，trace 不含决策 | 写 receipts + journal | S |
-| G-15 | Branch 生命周期 / GC | 未实现 | Portfolio 会留下所有候选分支 | 保留策略 + 删除/归档 | S |
+| G-14 | 决策包持久化 / 审计回执 | 已实现 | `<home>/decisions/<project>/` 下的 packet/latest/receipts | —（UAT-29 守护） | S |
+| G-15 | Branch 生命周期 / GC | 部分实现 | 决策记录可 `prune_packets`，`stale_branches` 给出候选；Branch 删除仍未实现（SDK 无删除原语） | daemon/SDK 侧删除或归档 | S |
 | G-16 | 鉴权与多租户 | 未实现 | 本地信任模型 | API/Socket 鉴权、能力隔离 | L |
 | G-17 | 指标 / 告警 / OTel | 未实现 | 只有 CLI stats 与 DSH trace | metrics endpoint + 埋点 | M |
 | G-18 | CI / 打包 / 发布 | 未实现 | 无流水线、无镜像、无签名 | CI（带 LayerFS 依赖）、镜像、release | M |
@@ -43,43 +43,33 @@
 
 ---
 
-## 2. DSH 宿主集成（M4，未实现）
+## 2. DSH 宿主集成（M4，已实现未验证）
 
 ### 2.1 当前状态
 
-- 只交付了 `integration/lfs-fleet.patch`：给 `lfs.js` 增加 `fleet` 子命令，已在真实 checkout 上 `git apply --check` 通过。
-- **补丁尚未应用**到正在运行的 DSH 源树（本会话对 `Projects/layerfs` 只有读权限）。因此现在运行中的 DSH 里，`node "$DSH_LAYERFS_CLI" fleet ...` **不可用**，除非你先应用补丁并设置 `AEGIS_FLEET_BIN`。
-- Bridge 有 `bind` op，可以原子合并 `bindings.json`，但没有接到宿主生命周期里。
-- trace 格式已用真实 `Collector` 验证（UAT-12），但这只证明“能读”，不证明“会显示”。
+- Workpack A 已把 DSH 宿主侧改动写进 `layerfs` checkout：
+  - `packages/host/src/env.js`：会话绑定项目且存在 `AEGIS_FLEET_BIN`/`DSH_LAYERFS_FLEET` 时，运行时上下文注入**自发编排规则**（portfolio / map-reduce / race / run / publish / reap）+ 子 Agent 专属分支名；
+  - `packages/host/src/lfs.js`：抽出 `runFleet`，并把 `portfolio`、`race`、`map-reduce`、`publish`、`reap` 注册为顶层命令（等同 `lfs fleet <cmd>`）；
+  - `packages/host/src/fleet-provider.js`：原生 `subagent` 的 `fleet` provider——启动前 fork `sub-<id>`、执行中注入分支、`AbortSignal`/Stop 触发 `fleet reap`、结束时把 `diff(main, sub-<id>)` 摘要附在结果里，**从不自动 publish**；
+  - `packages/host/src/index.js`：`ctx.inject(['subagents'])` 注册该 provider；
+  - `packages/dsh-layerfs/presets/layerfs-dsh-minimalist.patch.yml`：fleet 宿主配置与 persona 指引。
+- `packages/host/tests/host.mjs` 的 `projectContext` 断言已同步（多行上下文）。
+- 已通过 `node --check`、YAML 解析、`node tests/host.mjs`（`host: ok`）、以及真实 `lfs.js` 冒烟（`status` 正常；顶层 `reap` 确认转发进 `aegisfleet`）。
+- **但仍是「已实现未验证」**：当前运行的 DSH 进程在改动前启动，没有做端到端 subagent 派生实测。
+- 重要限制：`fleet-provider.js` 实现的是**外部后端**（`start`）；默认 preset 的 `provider` 仍是内置 `spawn`（本地 continuable）。要启用需要把 `tool-subagent` 的 `provider` 改成 `fleet`，并保证宿主另有带 `start` 的外部后端（如 dsh-sdk/acp）或给 `createFleetProvider` 注入 `delegate`，否则子 Agent 会不可用。
 
-### 2.2 缺少的部分
+### 2.2 仍缺少的部分
 
-1. `@dsh-layerfs/host` 的 `apply(ctx, config)` 中增加 `ctx.effect(ensureFleetDaemon(spec))`：随 `dsh web` 启停 escript/守护进程，写发现文件。
-2. `ctx.subagents.registerProvider("fleet", provider)`：
-   - 启动前分配 Branch 与 Workspace（调用 pool）；
-   - 把 Branch/Workspace 注入子 Agent 的 bash 环境；
-   - 结束后把 branch/commit/diff/verifier 输出作为结果交回主 Agent；
-   - 用户 Stop / 崩溃时由 watcher 兜底回收。
-3. `env.js` 注入 `AEGIS_FLEET_BIN` / `AEGIS_HOME` 等，让子 Agent 能调用 `lfs fleet`。
-4. 把 `agentId → {root, name}` 写入 `bindings.json`，让 trace 出现在 Work/History。
-5. 主 Agent 的“发布/上抛”决策：这是 DSH 对话层行为，内核不提供“问用户”原语。
+1. `ctx.effect(ensureFleetDaemon(spec))`：`dsh web` 生命周期托管 `fleet` 守护进程（G-02）。
+2. 子 Agent 结果的 `branch/commit/diff/verifier` 仍以文本摘要回传；没有结构化结果通道。
+3. GUI 卡片/分支树的真机验证（G-03）。
 
-### 2.3 影响
+### 2.3 关闭条件
 
-- 用户无法在 DSH 里用自然语言触发 `race/portfolio`；
-- 看不到 worker 卡片与分支树；
-- 子 Agent 不会自动隔离到独立 Branch；
-- 目前只能由主 Agent 手动执行 CLI。
-
-### 2.4 关闭条件
-
-- 应用补丁后，在 `dsh web` 中用自然语言触发一次 portfolio；
-- Work 面板出现具名 agent 卡片；
-- History 面板出现候选分支；
+- 重启 `dsh web` 后用自然语言触发一次 portfolio；
+- Work 面板出现具名 agent 卡片、History 面板出现候选分支；
 - 用户点 Stop 后 1s 内 `snapshot.workspaces=[]`；
 - 子 Agent 的结果不自动发布，主 Agent 能看到决策包。
-
----
 
 ## 3. Live / Docker 模式（已实现未验证）
 
@@ -99,7 +89,7 @@
 
 ### 3.3 关闭条件
 
-- 用同一个 `docs/UAT.md` 在 live 项目跑通 24 条（其中 `AEGIS_SIM=1` 改为 0，补 `LAYERFS_IMAGE/DAEMON/DOCKER/VOLUME`）；
+- 用同一个 `docs/UAT.md` 在 live 项目跑通 30 条（其中 `AEGIS_SIM=1` 改为 0，补 `LAYERFS_IMAGE/DAEMON/DOCKER/VOLUME`）；
 - 强制造出 17 个 mount，确认 pool 排队且 daemon 拒绝被正确退避；
 - 强杀 bridge，确认 `reap` 在 live 下只清 idle+clean。
 
@@ -118,22 +108,21 @@
 
 ## 5. 拓扑缺口
 
-### 5.1 Pipeline（未实现）
+### 5.1 Pipeline（已实现）
 
-设计文档的“闯关流水线”：Stage 1 写测试 → Stage 2 写实现 → Stage 3 压测；任意阶段失败回滚到上一阶段干净 Layer 并重试。
+- `src/aegis/topologies/pipeline.gleam`：`Stage(name, command, verifier)` 顺序闯关；每次尝试 `<prefix>-<stage>-try-<k>` **从上一阶段已验证 Commit 重新 fork**，因此上一次失败的脏写物理消失；`max_retries_per_stage` 耗尽后返回 `StageFailed` 并保持 `[pool] 0/16`。
+- 单测 3 条（三阶段成功 / 失败重试回滚 / 耗尽停止）+ UAT-25..28。
+- 已知边界：单个 Stage 只有一条 `command`，重试时命令相同；需要“第 2 次才正确”的场景要靠 Branch 之外的标记（测试用 `home` 下的 flag 文件），内核不注入 attempt 序号。
 
-- 现状：没有 `pipeline.gleam`，没有阶段状态机、回滚、`max_retries_per_stage`。
-- 关闭条件：新增拓扑 + 失败回滚测试 + UAT 用例。
+### 5.2 Blackboard（已实现，未自动注入 worker）
 
-### 5.2 Blackboard（未实现）
-
-- 现状：没有跨分支的 `FactDiscovered` / `PitfallWarning` / `InterfaceLocked`，worker 之间零共享。
-- 影响：并行候选会重复踩坑；MapReduce 的接口契约无法锁定。
-- 关闭条件：有历史回放的 pubsub actor + 至少一个 worker 消费路径 + 测试。
+- `src/aegis/blackboard.gleam`：`FactDiscovered` / `PitfallWarning` / `InterfaceLocked` 三种条目；`Subscribe` 先按 seq 重放全部历史再推新条目；`interface_conflict` 对同 path 不同签名返回先锁定条目；`snapshot_json` / `export_json` / `render_prompt` 供 shell worker 消费；`fleet blackboard` 是一个可复跑的演示。
+- 单测 2 条 + UAT-30。
+- 缺口：`worker_runner` 还不会在 `exec` 前自动把 `render_prompt` 拼进命令前缀（G-07 余项）。
 
 ### 5.3 已实现的拓扑
 
-Race、MapReduce、Portfolio 已实现，但：
+Race、MapReduce、Portfolio、Pipeline 已实现，但：
 - Race 的自动发布只保留为 `--publish` 选项（默认关闭）；
 - MapReduce 只做顺序折叠 merge，不做并行 merge 树；
 - Portfolio 不做自动排序（见 G-12）。
@@ -200,22 +189,22 @@ Race、MapReduce、Portfolio 已实现，但：
 - 这是刻意选择：测试通过不是“更好”的证明；主 Agent/用户决定是否发布或上抛。
 - 若未来加 `BestOf(metric)`，必须显式定义指标且仍然默认不自动发布。
 
-### 8.3 决策包不持久化（未实现）
+### 8.3 决策包已持久化（已实现）
 
-- `[packet]` 只打印到 stdout；没有写 receipts、没有 decision journal。
-- trace 记录的是 SDK 调用，不记录“主 Agent 为什么选 c”。
-- 关闭条件：把 packet/choice 写到 `<home>/<project>/decisions/`，并在 `fleet publish` 时校验。
+- `src/aegis/decision_store.gleam`：`<home>/decisions/<project>/packet-0001.json`（单调 seq）、`latest.json`、`receipts.jsonl`（真 append）。
+- `portfolio` / `race` / `map-reduce` / `pipeline` 都写 packet；`fleet publish` 与 `pipeline --publish` 追加发布回执；`fleet decisions` 读回。
+- 仍未做：“为什么选这个”的人工理由（choice）没有单独字段；回执不是密码学签名（见 8.1）。
 
 ---
 
 ## 9. 生命周期与运维
 
-### 9.1 Branch 保留/GC（未实现）
+### 9.1 Branch 保留/GC（部分实现）
 
 - Portfolio 会让所有候选 Branch 留在 Store 里；Race 的输家也保留已 commit 的 Branch。
-- 没有删除/归档命令，没有 TTL/保留策略。
-- 影响：长期运行会积累分支；History 面板变长。
-- 关闭条件：`fleet prune --older-than` 或项目级保留策略（注意：删除是不可逆的，必须显式确认）。
+- 新增：`decision_store.prune_packets(home, project, keep)` 删除旧决策包，`stale_branches(candidates, keep)` 给出可回收候选（纯函数）。
+- 仍未实现：Branch 的删除/归档命令——LayerFS SDK 没有删除 Branch 的原语，必须先加 daemon/SDK 能力。
+- 关闭条件：`fleet prune --older-than` 或项目级保留策略（删除不可逆，必须显式确认）。
 
 ### 9.2 安全与多租户（未实现）
 
@@ -255,8 +244,8 @@ Race、MapReduce、Portfolio 已实现，但：
 | :--- | :--- | :--- |
 | **M1** | 桥接 + WorkspacePool + trace | **已完成（sim 验证）**；live 未验证 |
 | **M2** | Opaque 门禁 + Race | **已完成**；抢占为逻辑抢占 |
-| **M3** | MapReduce + Blackboard | **MapReduce 已完成**；Blackboard 未实现 |
-| **M4** | DSH Provider / 端到端 | **未实现**；只有 `lfs.js` 补丁 |
+| **M3** | MapReduce + Blackboard | **已完成**（Blackboard actor + 回放 + 接口锁） |
+| **M4** | DSH Provider / 端到端 | **部分完成**：provider + 顶层别名 + preset 已落地，未在重启的 DSH 中实测 |
 
 另外新增了设计文档没有的 **Portfolio** 与 **`fleet publish`**，因为“第一个通过测试”不等于“最好的实现”，决策权应在主 Agent。
 
@@ -277,15 +266,15 @@ Race、MapReduce、Portfolio 已实现，但：
 
 **P0（让能力真正可用）**
 
-1. 应用 `lfs.js` 补丁并设置 `AEGIS_FLEET_BIN`；
-2. 实现 `FleetSubagentProvider` + `ensureFleetDaemon`（G-01/G-02）；
+1. 重启 `dsh web`，实测 `FleetSubagentProvider` 与自发 portfolio（G-01/G-03）；
+2. `ensureFleetDaemon` 生命周期托管（G-02）；
 3. 在 live 项目跑通 UAT（G-04）。
 
 **P1（补齐设计文档）**
 
-4. Pipeline（G-06）与 Blackboard（G-07）；
-5. 决策包持久化/回执（G-14）；
-6. 全局槽位记账（G-10）。
+4. Blackboard 快照自动注入 worker 命令前缀（G-07 余项）；
+5. 全局槽位记账（G-10）；
+6. Branch 删除/归档（G-15 余项）。
 
 **P2（生产化）**
 

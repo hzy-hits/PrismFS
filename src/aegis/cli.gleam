@@ -5,13 +5,16 @@
 //// agent chooses whether to publish one or escalate to the user. `fleet
 //// publish` is that choice, and it re-runs the verifier before it writes main.
 
+import aegis/blackboard
 import aegis/bridge
 import aegis/config
+import aegis/decision_store
 import aegis/domain/layer
 import aegis/domain/plan
 import aegis/native
 import aegis/sdk
 import aegis/topologies/map_reduce
+import aegis/topologies/pipeline
 import aegis/topologies/portfolio
 import aegis/topologies/race
 import aegis/verifier_gate
@@ -37,12 +40,17 @@ pub fn usage() -> String {
   <> "                                        parallel shards, merged and verified\n"
   <> "  fleet portfolio --verify \"<cmd>\" <name>:<command> ...\n"
   <> "                                        evaluate every approach; never publishes\n"
+  <> "  fleet pipeline [--publish] [--retries <n>] <stage>:<cmd>:<verifier> ...\n"
+  <> "                                        sequential stages; a failed stage\n"
+  <> "                                        re-forks the last verified Commit\n"
   <> "  fleet publish <branch> --verify \"<cmd>\"\n"
   <> "                                        the main agent's decision: re-verify, publish\n"
   <> "  fleet run <branch> \"<command>\" [--verify \"<cmd>\"]\n"
   <> "                                        one leased Workspace, one Commit\n"
   <> "  fleet demo <fixture-folder>           Race + explicit decision, fresh project\n"
   <> "  fleet demo-map-reduce <fixture>       MapReduce + explicit decision\n"
+  <> "  fleet decisions                       decision packets and publish receipts\n"
+  <> "  fleet blackboard                      cross-branch facts, a live demo\n"
   <> "  fleet help\n\n"
   <> "Only --publish (race, map-reduce) or `fleet publish` writes main. Everything\n"
   <> "else reports and lets the main agent decide.\n\n"
@@ -57,10 +65,13 @@ pub fn run(command: String, args: List(String)) -> Result(Nil, String) {
     "race" -> command_race(args)
     "map-reduce" -> command_map_reduce(args)
     "portfolio" -> command_portfolio(args)
+    "pipeline" -> command_pipeline(args)
     "publish" -> command_publish(args)
     "run" -> command_run(args)
     "demo" -> command_demo(args)
     "demo-map-reduce" -> command_demo_map_reduce(args)
+    "decisions" -> command_decisions(args)
+    "blackboard" -> command_blackboard(args)
     _ -> Error(usage())
   }
 }
@@ -140,7 +151,19 @@ fn command_race(args: List(String)) -> Result(Nil, String) {
       race.run(b, pool, opts) |> result.map_error(identity_error),
     )
     io.println("[race] " <> race.outcome_text(outcome))
+    let race_packet_json = race_packet(cfg, verifier, outcome)
+    io.println("[packet] " <> race_packet_json)
+    record_packet(cfg, "race", race_packet_json)
     case outcome {
+      race.Won(winner, _, _, True, _) -> {
+        record_receipt(
+          cfg,
+          layer.verified_branch(winner),
+          layer.verified_commit_id(winner),
+          verifier,
+        )
+        Nil
+      }
       race.Won(winner, _, _, False, _) -> {
         io.println("[decision] nothing published; choose with:")
         io.println(
@@ -178,7 +201,14 @@ fn command_map_reduce(args: List(String)) -> Result(Nil, String) {
       map_reduce.run(b, pool, opts) |> result.map_error(identity_error),
     )
     io.println("[map-reduce] " <> map_reduce.outcome_text(outcome))
+    let mr_packet_json = map_reduce_packet(cfg, verifier, outcome)
+    io.println("[packet] " <> mr_packet_json)
+    record_packet(cfg, "map-reduce", mr_packet_json)
     case outcome {
+      map_reduce.Merged(branch, commit, _, True, _) -> {
+        record_receipt(cfg, branch, commit, verifier)
+        Nil
+      }
       map_reduce.Merged(branch, _, _, False, _) -> {
         io.println("[decision] nothing published; choose with:")
         io.println(
@@ -226,7 +256,9 @@ fn command_portfolio(args: List(String)) -> Result(Nil, String) {
         files -> io.println("      " <> string.join(files, ", "))
       }
     })
-    io.println("[packet] " <> portfolio_packet(cfg, verifier, reports))
+    let packet = portfolio_packet(cfg, verifier, reports)
+    io.println("[packet] " <> packet)
+    record_packet(cfg, "portfolio", packet)
     io.println(
       "[decision] nothing published; the main agent chooses a branch and runs:",
     )
@@ -299,6 +331,7 @@ fn publish_branch(
       io.println(
         "[publish] main updated from " <> branch <> " (" <> short(head) <> ")",
       )
+      record_receipt(cfg, branch, head, verifier)
       Ok(Nil)
     }
   }
@@ -552,6 +585,484 @@ fn command_demo_map_reduce(args: List(String)) -> Result(Nil, String) {
     report_pool(pool, cfg)
     Ok(Nil)
   })
+}
+
+// ---------------------------------------------------------------- pipeline
+
+fn command_pipeline(args: List(String)) -> Result(Nil, String) {
+  use cfg <- result.try(load_config())
+  use #(publish, retries, timeout_ms, stages) <- result.try(
+    parse_pipeline(args, False, 0, 120_000, []),
+  )
+  with_fleet(cfg, fn(b, pool) {
+    let opts =
+      pipeline.PipelineOpts(
+        base: "main",
+        branch_prefix: "pipe",
+        stages: stages,
+        max_retries_per_stage: retries,
+        publish: publish,
+        timeout_ms: timeout_ms,
+        queue_timeout: cfg.queue_timeout,
+        exec_timeout: cfg.exec_timeout,
+        call_timeout: cfg.call_timeout,
+      )
+    use outcome <- result.try(
+      pipeline.run(b, pool, opts) |> result.map_error(identity_error),
+    )
+    io.println("[pipeline] " <> pipeline_summary(outcome, stages))
+    list.each(pipeline_history(outcome), fn(record) {
+      io.println(
+        "  stage "
+        <> pad(record.name, 14)
+        <> pad(record.branch, 28)
+        <> int.to_string(record.attempts)
+        <> " attempt(s), verified "
+        <> short(layer.verified_commit_id(record.verified)),
+      )
+    })
+    let packet = pipeline_packet(cfg, opts, outcome)
+    io.println("[packet] " <> packet)
+    record_packet(cfg, "pipeline", packet)
+    case outcome {
+      pipeline.Completed(final, _history, _retries, True, _total) -> {
+        io.println(
+          "[publish] main updated from " <> layer.verified_branch(final),
+        )
+        record_receipt(
+          cfg,
+          layer.verified_branch(final),
+          layer.verified_commit_id(final),
+          last_verifier(stages),
+        )
+        report_pool(pool, cfg)
+        Ok(Nil)
+      }
+      pipeline.Completed(final, _history, _retries, False, _total) -> {
+        io.println("[decision] nothing published; publish it with:")
+        io.println(
+          "  fleet publish "
+          <> layer.verified_branch(final)
+          <> " --verify "
+          <> quoted(last_verifier(stages)),
+        )
+        report_pool(pool, cfg)
+        Ok(Nil)
+      }
+      pipeline.StageFailed(name, attempts, reason, _completed) -> {
+        io.println("[decision] nothing published: stage " <> name <> " failed")
+        report_pool(pool, cfg)
+        Error(
+          "pipeline stage "
+          <> name
+          <> " failed after "
+          <> int.to_string(attempts)
+          <> " attempt(s): "
+          <> reason,
+        )
+      }
+    }
+  })
+}
+
+fn pipeline_summary(
+  outcome: pipeline.PipelineOutcome,
+  stages: List(pipeline.Stage),
+) -> String {
+  case outcome {
+    pipeline.Completed(_final, history, retries_used, published, total_ms) ->
+      int.to_string(list.length(history))
+      <> "/"
+      <> int.to_string(list.length(stages))
+      <> " stages verified in "
+      <> int.to_string(total_ms)
+      <> "ms ("
+      <> int.to_string(retries_used)
+      <> " retr"
+      <> case retries_used == 1 {
+        True -> "y"
+        False -> "ies"
+      }
+      <> "); "
+      <> case published {
+        True -> "published to main"
+        False -> "NOT published (caller decides)"
+      }
+    pipeline.StageFailed(name, attempts, reason, completed) ->
+      "stage "
+      <> name
+      <> " failed after "
+      <> int.to_string(attempts)
+      <> " attempt(s) ("
+      <> int.to_string(list.length(completed))
+      <> " stage(s) already verified): "
+      <> reason
+  }
+}
+
+fn pipeline_history(
+  outcome: pipeline.PipelineOutcome,
+) -> List(pipeline.StageRecord) {
+  case outcome {
+    pipeline.Completed(_final, history, _, _, _) -> history
+    pipeline.StageFailed(_, _, _, completed) -> completed
+  }
+}
+
+fn last_verifier(stages: List(pipeline.Stage)) -> String {
+  case list.last(stages) {
+    Ok(stage) -> stage.verifier
+    Error(Nil) -> "true"
+  }
+}
+
+fn pipeline_packet(
+  cfg: config.Config,
+  opts: pipeline.PipelineOpts,
+  outcome: pipeline.PipelineOutcome,
+) -> String {
+  let stages =
+    json.array(pipeline_history(outcome), fn(record) {
+      json.object([
+        #("name", json.string(record.name)),
+        #("branch", json.string(record.branch)),
+        #("attempts", json.int(record.attempts)),
+        #("commit", json.string(layer.verified_commit_id(record.verified))),
+      ])
+    })
+  let result = case outcome {
+    pipeline.Completed(final, _, retries_used, published, total_ms) ->
+      json.object([
+        #("outcome", json.string("completed")),
+        #("finalBranch", json.string(layer.verified_branch(final))),
+        #("finalCommit", json.string(layer.verified_commit_id(final))),
+        #("retriesUsed", json.int(retries_used)),
+        #("published", json.bool(published)),
+        #("totalMs", json.int(total_ms)),
+      ])
+    pipeline.StageFailed(name, attempts, reason, _) ->
+      json.object([
+        #("outcome", json.string("stage-failed")),
+        #("stage", json.string(name)),
+        #("attempts", json.int(attempts)),
+        #("reason", json.string(reason)),
+      ])
+  }
+  json.object([
+    #("aegisfleet", json.int(1)),
+    #("kind", json.string("pipeline")),
+    #("project", json.string(cfg.project)),
+    #("base", json.string(opts.base)),
+    #("maxRetriesPerStage", json.int(opts.max_retries_per_stage)),
+    #("requestedPublish", json.bool(opts.publish)),
+    #("stages", stages),
+    #("result", result),
+  ])
+  |> json.to_string
+}
+
+fn parse_pipeline(
+  args: List(String),
+  publish: Bool,
+  retries: Int,
+  timeout_ms: Int,
+  stages: List(pipeline.Stage),
+) -> Result(#(Bool, Int, Int, List(pipeline.Stage)), String) {
+  case args {
+    [] ->
+      case stages {
+        [] -> Error("pipeline needs at least one <stage>:<command>:<verifier>")
+        found -> Ok(#(publish, retries, timeout_ms, list.reverse(found)))
+      }
+    ["--publish", ..rest] ->
+      parse_pipeline(rest, True, retries, timeout_ms, stages)
+    ["--retries", value, ..rest] ->
+      parse_pipeline(
+        rest,
+        publish,
+        int.parse(value) |> result.unwrap(0),
+        timeout_ms,
+        stages,
+      )
+    ["--timeout", value, ..rest] ->
+      parse_pipeline(
+        rest,
+        publish,
+        retries,
+        int.parse(value) |> result.unwrap(120_000),
+        stages,
+      )
+    [spec, ..rest] -> {
+      use stage <- result.try(parse_stage(spec))
+      parse_pipeline(rest, publish, retries, timeout_ms, [stage, ..stages])
+    }
+  }
+}
+
+fn parse_stage(spec: String) -> Result(pipeline.Stage, String) {
+  case string.split(spec, ":") {
+    [name, command, verifier] ->
+      Ok(pipeline.Stage(name: name, command: command, verifier: verifier))
+    [name, _command] ->
+      Error(
+        "stage " <> name <> " has no verifier: use <stage>:<command>:<verifier>",
+      )
+    parts ->
+      case list.length(parts) < 3 {
+        True ->
+          Error("stage " <> spec <> " is not <stage>:<command>:<verifier>")
+        False -> {
+          let name = result.unwrap(list.first(parts), "stage")
+          let reversed = list.reverse(parts)
+          let verifier = result.unwrap(list.first(reversed), "true")
+          let command =
+            reversed
+            |> list.drop(1)
+            |> list.reverse
+            |> list.drop(1)
+            |> string.join(":")
+          Ok(pipeline.Stage(name: name, command: command, verifier: verifier))
+        }
+      }
+  }
+}
+
+// ---------------------------------------------------------------- ledger
+
+fn record_packet(cfg: config.Config, kind: String, packet_json: String) {
+  case decision_store.record_packet(cfg.home, cfg.project, kind, packet_json) {
+    Ok(path) -> io.println("[ledger] packet " <> path)
+    Error(reason) ->
+      io.println("[ledger] could not record the packet: " <> reason)
+  }
+}
+
+fn record_receipt(
+  cfg: config.Config,
+  branch: String,
+  commit_id: String,
+  verifier: String,
+) {
+  case
+    decision_store.record_publish(
+      cfg.home,
+      cfg.project,
+      branch,
+      commit_id,
+      verifier,
+    )
+  {
+    Ok(Nil) -> io.println("[ledger] publish receipt for " <> branch)
+    Error(reason) ->
+      io.println("[ledger] could not record the receipt: " <> reason)
+  }
+}
+
+fn command_decisions(_args: List(String)) -> Result(Nil, String) {
+  use cfg <- result.try(load_config())
+  io.println("[decisions] project " <> cfg.project <> ", home " <> cfg.home)
+  let kept = decision_store.packet_count(cfg.home, cfg.project)
+  case decision_store.latest_packet(cfg.home, cfg.project) {
+    Ok(packet) ->
+      io.println(
+        "[decisions] latest packet kept: "
+        <> int.to_string(kept)
+        <> " -> "
+        <> first_chars(packet, 400),
+      )
+    Error(reason) -> io.println("[decisions] no packet yet: " <> reason)
+  }
+  let receipts = decision_store.list_receipts(cfg.home, cfg.project)
+  io.println("[decisions] receipts: " <> int.to_string(list.length(receipts)))
+  list.each(receipts, fn(receipt) {
+    io.println("  " <> decision_store.receipt_text(receipt))
+  })
+  Ok(Nil)
+}
+
+fn first_chars(text: String, limit: Int) -> String {
+  case string.length(text) > limit {
+    True -> string.slice(text, 0, limit) <> "…"
+    False -> text
+  }
+}
+
+// ---------------------------------------------------------------- blackboard
+
+fn command_blackboard(_args: List(String)) -> Result(Nil, String) {
+  use cfg <- result.try(load_config())
+  use board <- result.try(case blackboard.start() {
+    Ok(board) -> Ok(board)
+    Error(Nil) -> Error("the blackboard did not start")
+  })
+  blackboard.post(
+    board,
+    "race-a",
+    "race-alpha",
+    blackboard.FactDiscovered("api", "auth endpoint moved to /v2/login"),
+  )
+  blackboard.post(
+    board,
+    "race-b",
+    "race-beta",
+    blackboard.PitfallWarning(
+      "npm run build",
+      "needs NODE_OPTIONS=--max-old-space-size=4096",
+    ),
+  )
+  let subscriber = process.new_subject()
+  blackboard.subscribe(board, subscriber)
+  let replayed = drain_entries(subscriber, 2000, 0)
+  io.println(
+    "[blackboard] replay: "
+    <> int.to_string(replayed)
+    <> " entries delivered to a late subscriber",
+  )
+  blackboard.post(
+    board,
+    "mr-c",
+    "merge-c",
+    blackboard.InterfaceLocked(
+      "/src/types.ts",
+      "export interface User { id: string }",
+    ),
+  )
+  let live = drain_entries(subscriber, 2000, 0)
+  io.println("[blackboard] live: " <> int.to_string(live) <> " new entry")
+  let entries = blackboard.snapshot(board, 5000) |> result.unwrap([])
+  list.each(entries, fn(entry) {
+    io.println("  " <> blackboard.entry_text(entry))
+  })
+  case
+    blackboard.interface_conflict(
+      entries,
+      "/src/types.ts",
+      "export interface User { id: number }",
+    )
+  {
+    Ok(Nil) -> io.println("[blackboard] interface lock: no conflict")
+    Error(existing) ->
+      io.println(
+        "[blackboard] interface lock: conflict detected for /src/types.ts (first locked at seq "
+        <> int.to_string(existing.seq)
+        <> ")",
+      )
+  }
+  let path = cfg.trace_dir <> "/blackboard.json"
+  case blackboard.export_json(board, path, 5000) {
+    Ok(Nil) -> io.println("[blackboard] exported " <> path)
+    Error(reason) -> io.println("[blackboard] could not export: " <> reason)
+  }
+  blackboard.stop(board)
+  Ok(Nil)
+}
+
+/// Receives every `Entry` already waiting in `subscriber`'s mailbox, waiting at
+/// most `timeout` ms for each one; returns how many arrived.
+fn drain_entries(
+  subscriber: process.Subject(blackboard.Entry),
+  timeout: Int,
+  seen: Int,
+) -> Int {
+  case process.receive(subscriber, timeout) {
+    Ok(_entry) -> drain_entries(subscriber, timeout, seen + 1)
+    Error(Nil) -> seen
+  }
+}
+
+// ---------------------------------------------------------------- packets
+
+fn race_packet(
+  cfg: config.Config,
+  verifier: String,
+  outcome: race.RaceOutcome,
+) -> String {
+  let result = case outcome {
+    race.Won(winner, losers, preempted_in_ms, published, total_ms) ->
+      json.object([
+        #("outcome", json.string("won")),
+        #("branch", json.string(layer.verified_branch(winner))),
+        #("commit", json.string(layer.verified_commit_id(winner))),
+        #("worker", json.string(layer.verified_worker(winner))),
+        #("losers", json.array(losers, json.string)),
+        #("preemptedMs", json.int(preempted_in_ms)),
+        #("published", json.bool(published)),
+        #("totalMs", json.int(total_ms)),
+      ])
+    race.AllFailed(failures) ->
+      json.object([
+        #("outcome", json.string("all-failed")),
+        #(
+          "failures",
+          json.array(failures, fn(pair) {
+            let #(name, reason) = pair
+            json.object([
+              #("name", json.string(name)),
+              #("reason", json.string(reason)),
+            ])
+          }),
+        ),
+      ])
+    race.TimedOut(seen) ->
+      json.object([
+        #("outcome", json.string("timed-out")),
+        #("seen", json.int(seen)),
+      ])
+  }
+  json.object([
+    #("aegisfleet", json.int(1)),
+    #("kind", json.string("race")),
+    #("project", json.string(cfg.project)),
+    #("verifier", json.string(verifier)),
+    #("published", json.null()),
+    #("result", result),
+  ])
+  |> json.to_string
+}
+
+fn map_reduce_packet(
+  cfg: config.Config,
+  verifier: String,
+  outcome: map_reduce.MapReduceOutcome,
+) -> String {
+  let result = case outcome {
+    map_reduce.Merged(branch, commit, shards, published, total_ms) ->
+      json.object([
+        #("outcome", json.string("merged")),
+        #("branch", json.string(branch)),
+        #("commit", json.string(commit)),
+        #("shards", json.array(shards, json.string)),
+        #("published", json.bool(published)),
+        #("totalMs", json.int(total_ms)),
+      ])
+    map_reduce.ShardFailed(shard, reason) ->
+      json.object([
+        #("outcome", json.string("shard-failed")),
+        #("shard", json.string(shard)),
+        #("reason", json.string(reason)),
+      ])
+    map_reduce.MergeFailed(branch, with, reason) ->
+      json.object([
+        #("outcome", json.string("merge-failed")),
+        #("branch", json.string(branch)),
+        #("with", json.string(with)),
+        #("reason", json.string(reason)),
+      ])
+    map_reduce.TimedOut(seen) ->
+      json.object([
+        #("outcome", json.string("timed-out")),
+        #("seen", json.int(seen)),
+      ])
+  }
+  json.object([
+    #("aegisfleet", json.int(1)),
+    #("kind", json.string("map-reduce")),
+    #("project", json.string(cfg.project)),
+    #("verifier", json.string(verifier)),
+    #("published", json.null()),
+    #("result", result),
+  ])
+  |> json.to_string
 }
 
 // ---------------------------------------------------------------- helpers
