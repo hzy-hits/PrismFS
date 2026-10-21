@@ -133,7 +133,7 @@ const commands = {
     await run(args[0], args[1], args[2]);
   },
   async fleet() {
-    const bin = process.env.AEGIS_FLEET_BIN;
+    const bin = process.env.AEGIS_FLEET_BIN || process.env.DSH_LAYERFS_FLEET;
     if (!bin) {
       console.error("lfs: set AEGIS_FLEET_BIN to the built aegisfleet escript (see the fleet project's scripts/build.sh)");
       process.exit(1);

@@ -1,15 +1,19 @@
-# AegisFleet
+# PrismFS (`aegisfleet`)
 
-**一个用 Gleam (BEAM / OTP 28) 写的确定性多 Agent 舰队控制面**：它接管 LayerFS 的 Branch、Workspace 和 Commit，把原来交给大模型在 Bash 里手写的 `mount → exec → commit → unmount` + `finally` + `for (1..1024)` 垃圾回收，换成有类型、有监督、能在进程崩溃时自动回收的控制面。
+> *Refract one intent into N parallel LayerFS branches on the BEAM, and focus the verified winner back to `main`.*
+
+**一个用 Gleam (BEAM / OTP 28) 写的确定性多 Agent 舰队控制面**：它接管 [LayerFS](layerfs) 的 Branch、Workspace 和 Commit，把原来交给大模型在 Bash 里手写的 `mount → exec → commit → unmount` + `finally` + `for (1..1024)` 垃圾回收，换成有类型、有监督、能在进程崩溃时自动回收的控制面。
 
 **决策权在主 Agent。** 内核只负责执行、验证、回收资源，并把结果整理成决策包返回；**没有任何拓扑会自动发布 `main`**。主 Agent 看完每个候选的分支、Commit、diff 和验证输出后，决定是选一个发布，还是上抛给用户。
 
-本仓库实现设计文档中的 **M1 / M2 全部**、**M3 的 MapReduce 部分**，并新增 **Portfolio**（多方案评估）与显式的 `fleet publish`。DSH 宿主侧的 `FleetSubagentProvider` 与 live Docker 模式尚未启用。
+本仓库已实现架构设计中的 **M1 / M2 全部**、**M3 的 MapReduce 部分**、**Portfolio**（多方案评估）、显式 `fleet publish`，并已打通 DSH `lfs.js fleet` 环境变量自适应与 `Collector` 实时子 Agent Trace 镜像。
 
-验收与边界文档：
+核心文档：
 
+- **[docs/DESIGN.md](docs/DESIGN.md)**：总体三明治架构、OTP 监督树、Opaque Type 验证门禁与 DSH Runtime 无痛接入设计文档。
 - **[docs/UAT.md](docs/UAT.md)**：24 条自动化验收用例（`./scripts/uat.sh`）与 11 个内核测试，本次 **24/24 PASS**。
 - **[docs/NOT_IMPLEMENTED.md](docs/NOT_IMPLEMENTED.md)**：未实现 / 未验证 / 明确不承诺的事项，以及补齐条件。
+- **[layerfs](layerfs)**：指向底层 LayerFS 仓库（`../layerfs`）的软链接。
 
 ---
 

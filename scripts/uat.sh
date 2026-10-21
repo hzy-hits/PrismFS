@@ -49,7 +49,8 @@ expect "UAT-12 DSH collector contract" "collector accepted" "$OUT"
 node verify/leak_reap.mjs >"$OUT" 2>&1
 expect "UAT-13 janitor reaps a leaked Workspace" "reaped" "$OUT"
 
-git -C "$LAYERFS_DIR" apply --check "$ROOT/integration/lfs-fleet.patch" >"$OUT" 2>&1 \
+(git -C "$LAYERFS_DIR" apply --check "$ROOT/integration/lfs-fleet.patch" \
+  || git -C "$LAYERFS_DIR" apply --reverse --check "$ROOT/integration/lfs-fleet.patch") >"$OUT" 2>&1 \
   && pass "UAT-14 lfs.js patch applies" || fail "UAT-14 lfs.js patch applies"
 
 # ---------------------------------------------------------------- portfolio

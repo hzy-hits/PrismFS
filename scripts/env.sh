@@ -3,10 +3,17 @@
 # Override LAYERFS_DIR to point at another checkout.
 set -euo pipefail
 AEGIS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LAYERFS_DIR="${LAYERFS_DIR:-/Users/huangzhenyu/Projects/layerfs}"
+if [ -d "$AEGIS_ROOT/layerfs/dsh" ]; then
+  DEFAULT_LAYERFS="$AEGIS_ROOT/layerfs"
+else
+  DEFAULT_LAYERFS="/Users/huangzhenyu/Projects/layerfs"
+fi
+LAYERFS_DIR="${LAYERFS_DIR:-$DEFAULT_LAYERFS}"
 SIM="$LAYERFS_DIR/dsh/packages/host/src/sim"
 if [ -z "${GLEAM_BIN:-}" ]; then
-  if [ -x "$AEGIS_ROOT/../.toolchain/gleam" ]; then
+  if [ -x "$AEGIS_ROOT/.toolchain/gleam" ]; then
+    GLEAM_BIN="$AEGIS_ROOT/.toolchain/gleam"
+  elif [ -x "$AEGIS_ROOT/../.toolchain/gleam" ]; then
     GLEAM_BIN="$AEGIS_ROOT/../.toolchain/gleam"
   else
     GLEAM_BIN="$(command -v gleam || true)"

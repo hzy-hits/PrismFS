@@ -117,9 +117,22 @@ find_executable(Name) ->
     end.
 
 priv_dir(App) ->
-    case code:priv_dir(list_to_atom(unicode:characters_to_list(App))) of
-        {error, _} -> {error, nil};
-        Dir -> {ok, unicode:characters_to_binary(Dir)}
+    Candidate = case code:priv_dir(list_to_atom(unicode:characters_to_list(App))) of
+        {error, _} -> "";
+        Dir -> Dir
+    end,
+    case filelib:is_dir(Candidate) of
+        true -> {ok, unicode:characters_to_binary(Candidate)};
+        false ->
+            case is_escript() of
+                true ->
+                    EscriptPriv = filename:join(filename:dirname(escript:script_name()), "priv"),
+                    case filelib:is_dir(EscriptPriv) of
+                        true -> {ok, unicode:characters_to_binary(EscriptPriv)};
+                        false -> {error, nil}
+                    end;
+                false -> {error, nil}
+            end
     end.
 
 halt(Code) ->

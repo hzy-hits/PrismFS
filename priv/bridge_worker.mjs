@@ -62,11 +62,17 @@ const lf = new LayerFS(PROJECT);
 
 /** The simulator's own read model, when this bridge drives a simulated project. */
 let simOperator = null;
-if (env.AEGIS_SIM_CLIENT) {
-  const entry = isAbsolute(env.AEGIS_SIM_CLIENT) ? pathToFileURL(env.AEGIS_SIM_CLIENT).href : env.AEGIS_SIM_CLIENT;
+const simClientSpec = env.AEGIS_SIM_CLIENT || (env.AEGIS_SIM === "1" && SDK.includes("/sim/sdk.js")
+  ? new URL("./client.js", isAbsolute(SDK) ? pathToFileURL(SDK).href : SDK).href
+  : "");
+if (simClientSpec) {
+  const entry = isAbsolute(simClientSpec) ? pathToFileURL(simClientSpec).href : simClientSpec;
   const { simClient } = await import(entry);
   simOperator = simClient(HOME, PROJECT).operator;
 }
+
+const DSH_TRACE = env.DSH_LAYERFS_TRACE || "";
+const traceOffsets = new Map();
 
 /** One SDK client per trace name: the SDK writes that file's trace lines. */
 const clients = new Map();
@@ -75,10 +81,29 @@ function clientFor(trace) {
   let client = clients.get(trace);
   if (!client) {
     const file = join(TRACE_DIR, `${trace}.jsonl`);
+    traceOffsets.set(trace, existsSync(file) ? readFileSync(file, "utf8").length : 0);
     client = new LayerFS(PROJECT, { trace: file });
     clients.set(trace, client);
   }
   return client;
+}
+
+function mirrorDshTrace(trace) {
+  if (!DSH_TRACE || !trace || !TRACE_DIR) return;
+  const file = join(TRACE_DIR, `${trace}.jsonl`);
+  if (file === DSH_TRACE || !existsSync(file)) return;
+  try {
+    const raw = readFileSync(file, "utf8");
+    const prev = traceOffsets.get(trace) ?? 0;
+    if (raw.length <= prev) return;
+    const chunk = raw.slice(prev);
+    traceOffsets.set(trace, raw.length);
+    for (const line of chunk.split("\n")) {
+      if (!line.trim()) continue;
+      const parsed = JSON.parse(line);
+      appendFileSync(DSH_TRACE, `${JSON.stringify({ ...parsed, agent: trace })}\n`);
+    }
+  } catch { /* never fail an op on trace mirror */ }
 }
 
 /** Sandboxes this process mounted in, so a lost kernel still cleans up. */
@@ -308,6 +333,7 @@ async function handle(frame) {
   }
   const { id, op, args = {} } = request ?? {};
   const trace = request?.trace ?? args.trace;
+  const effectiveTrace = trace ?? (args.path ? mounts.get(args.path)?.trace : null);
   const fn = ops[op];
   if (!fn) {
     send({ id, ok: false, error: { code: "UnknownMethod", message: `unknown op ${op}` } });
@@ -315,8 +341,10 @@ async function handle(frame) {
   }
   try {
     const result = await fn({ ...args, trace });
+    mirrorDshTrace(effectiveTrace);
     send({ id, ok: true, result: result ?? null });
   } catch (error) {
+    mirrorDshTrace(effectiveTrace);
     if (op === "mount" && error?.code) log(`mount failed: ${error.code}: ${error.message}`);
     send({ id, ok: false, error: { code: error?.code ?? "Failed", message: error?.message ?? String(error), detail: error?.detail ?? null } });
   }

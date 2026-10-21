@@ -71,19 +71,30 @@ pub fn load() -> Result(Config, String) {
       |> result.replace_error("node is not on PATH; set AEGIS_NODE")
   }
   use node <- result.try(node)
-  let project = option(env("AEGIS_PROJECT"), "aegis-fleet")
+  let project =
+    env_any(["AEGIS_PROJECT", "DSH_LAYERFS_PROJECT"])
+    |> result.unwrap("aegis-fleet")
   let bridge_script = case env("AEGIS_BRIDGE") {
     Some(path) -> path
     None -> default_bridge_script()
   }
   let trace_dir = option(env("AEGIS_TRACE_DIR"), home <> "/traces")
+  let operator =
+    env_any(["AEGIS_OPERATOR", "DSH_LAYERFS_OPERATOR"])
+    |> option.from_result
+  let sim = case env("AEGIS_SIM") {
+    Some(v) -> v == "1"
+    None ->
+      env("DSH_LAYERFS_DOCKER") == Some("sim")
+      || string.ends_with(sdk, "/sim/sdk.js")
+  }
   Ok(Config(
     project: project,
     home: home,
     sdk: sdk,
-    operator: env("AEGIS_OPERATOR"),
+    operator: operator,
     sim_client: env("AEGIS_SIM_CLIENT"),
-    sim: option(env("AEGIS_SIM"), "0") == "1",
+    sim: sim,
     node: node,
     bridge_script: bridge_script,
     trace_dir: trace_dir,

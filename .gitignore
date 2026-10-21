@@ -3,3 +3,5 @@ home/
 aegisfleet
 erl_crash.dump
 .history/
+.toolchain/
+.home/
