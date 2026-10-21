@@ -1,0 +1,29 @@
+--- a/dsh/packages/host/src/lfs.js	2026-10-21 17:33:31
++++ b/dsh/packages/host/src/lfs.js	2026-10-21 17:33:31
+@@ -15,6 +15,8 @@
+   write <branch> <path> [msg]    file content from stdin, one Commit
+   run <branch> <command> [msg]   run bash in a new Workspace of the Branch and
+                                  Commit what it changed (--discard: keep nothing)
++  fleet <command> ...            the AegisFleet kernel: status, reap, race, run
++                                 (needs AEGIS_FLEET_BIN, the aegisfleet escript)
+ A ref is main, a Branch, a Commit id or a Layer id; paths are absolute.`;
+ 
+ const [cmd, ...rest] = process.argv.slice(2);
+@@ -130,6 +132,17 @@
+     need(2);
+     await run(args[0], args[1], args[2]);
+   },
++  async fleet() {
++    const bin = process.env.AEGIS_FLEET_BIN;
++    if (!bin) {
++      console.error("lfs: set AEGIS_FLEET_BIN to the built aegisfleet escript (see the fleet project's scripts/build.sh)");
++      process.exit(1);
++    }
++    const { spawnSync } = await import("node:child_process");
++    const child = spawnSync(bin, args, { stdio: "inherit", env: process.env });
++    if (child.error) { console.error(`lfs: fleet: ${child.error.message}`); process.exit(1); }
++    code = child.status ?? 1;
++  },
+ };
+ 
+ const MAIN_RO = "main is read-only: it's the published version, not a Branch. Read it (ls, cat, grep main ...),\nor fork a Branch (lfs fork <name>), work there and publish it.";
