@@ -17,6 +17,7 @@ It replaces fragile, prompt-driven shell orchestration (`mount → exec → comm
 ## Documentation
 
 - **[Architecture & Engineering Design (`docs/DESIGN.md`)](docs/DESIGN.md)**: System architecture, OTP actor state machines, opaque type gates, and zero-intrusion DSH runtime integration.
+- **[Multi-Agent Parallel Implementation Spec (`docs/AGENT_FLEET_SPEC.md`)](docs/AGENT_FLEET_SPEC.md)**: Orthogonal workpack specification (`Workpacks A ~ E`) and master dispatch prompt for autonomous multi-agent implementation in DSH.
 - **[User Acceptance Testing (`docs/UAT.md`)](docs/UAT.md)**: 24 automated end-to-end acceptance checks (`./scripts/uat.sh`) and 11 kernel unit tests.
 - **[Scope & Boundaries (`docs/NOT_IMPLEMENTED.md`)](docs/NOT_IMPLEMENTED.md)**: Explicit list of unimplemented features, unverified backends, and non-goals.
 

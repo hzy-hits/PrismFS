@@ -17,6 +17,7 @@
 ## 核心文档导航
 
 - **[架构与工程设计文档 (`docs/DESIGN.md`)](docs/DESIGN.md)**：三明治总体架构、OTP 状态机设计、Opaque Type 门禁与 DSH Runtime 无痛接入方案。
+- **[大规模多 Agent 并行实现规格书 (`docs/AGENT_FLEET_SPEC.md`)](docs/AGENT_FLEET_SPEC.md)**：按正交文件边界拆分的 5 大工作包（`Workpacks A ~ E`）契约与 DSH 主 Agent 一键启动 Prompt。
 - **[验收测试报告 (`docs/UAT.md`)](docs/UAT.md)**：24 项端到端自动化验收测试（`./scripts/uat.sh`）与 11 项内核单元测试明细（**24/24 PASS**）。
 - **[未实现与边界说明 (`docs/NOT_IMPLEMENTED.md`)](docs/NOT_IMPLEMENTED.md)**：当前未实现能力、未验证环境边界及后续演进路线。
 
