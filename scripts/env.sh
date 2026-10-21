@@ -11,13 +11,7 @@ fi
 LAYERFS_DIR="${LAYERFS_DIR:-$DEFAULT_LAYERFS}"
 SIM="$LAYERFS_DIR/dsh/packages/host/src/sim"
 if [ -z "${GLEAM_BIN:-}" ]; then
-  if [ -x "$AEGIS_ROOT/.toolchain/gleam" ]; then
-    GLEAM_BIN="$AEGIS_ROOT/.toolchain/gleam"
-  elif [ -x "$AEGIS_ROOT/../.toolchain/gleam" ]; then
-    GLEAM_BIN="$AEGIS_ROOT/../.toolchain/gleam"
-  else
-    GLEAM_BIN="$(command -v gleam || true)"
-  fi
+  GLEAM_BIN="$(command -v gleam || true)"
 fi
 if [ -z "${GLEAM_BIN:-}" ]; then
   echo "aegis: no gleam found; install Gleam >= 1.14 or set GLEAM_BIN" >&2
