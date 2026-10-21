@@ -4,7 +4,12 @@
 
 **决策权在主 Agent。** 内核只负责执行、验证、回收资源，并把结果整理成决策包返回；**没有任何拓扑会自动发布 `main`**。主 Agent 看完每个候选的分支、Commit、diff 和验证输出后，决定是选一个发布，还是上抛给用户。
 
-本仓库实现设计文档中的 **M1 / M2 全部**、**M3 的 MapReduce 部分**，并新增 **Portfolio**（多方案评估）与显式的 `fleet publish`。DSH 宿主侧的 `FleetSubagentProvider` 与 live Docker 模式尚未启用，边界见「[已验证 / 未验证](#已验证--未验证)」。
+本仓库实现设计文档中的 **M1 / M2 全部**、**M3 的 MapReduce 部分**，并新增 **Portfolio**（多方案评估）与显式的 `fleet publish`。DSH 宿主侧的 `FleetSubagentProvider` 与 live Docker 模式尚未启用。
+
+验收与边界文档：
+
+- **[docs/UAT.md](docs/UAT.md)**：24 条自动化验收用例（`./scripts/uat.sh`）与 11 个内核测试，本次 **24/24 PASS**。
+- **[docs/NOT_IMPLEMENTED.md](docs/NOT_IMPLEMENTED.md)**：未实现 / 未验证 / 明确不承诺的事项，以及补齐条件。
 
 ---
 
@@ -15,6 +20,7 @@
 ```bash
 cd aegisfleet
 ./scripts/test.sh          # 11 个内核测试，跑在真实 LayerFS 模拟器上
+./scripts/uat.sh           # 24 条验收用例，逐条 PASS/FAIL（docs/UAT.md）
 ./scripts/demo.sh          # Race → 报告 → 主 Agent 决策 → 显式发布
 ./scripts/build.sh         # 生成独立可执行文件 ./aegisfleet
 ./aegisfleet demo-map-reduce priv/fixture_mr
@@ -261,10 +267,11 @@ aegisfleet/
 │       ├── topologies/race.gleam
 │       ├── topologies/map_reduce.gleam
 │       └── topologies/portfolio.gleam
+├── docs/                        # UAT.md（验收）· NOT_IMPLEMENTED.md（边界）
 ├── test/                        # 11 个 gleeunit 测试
 ├── verify/                      # Node 侧协议与 Collector 契约验证
 ├── integration/                 # lfs.js 补丁与完整文件
-└── scripts/                     # env / test / demo / build / prove_opaque
+└── scripts/                     # env / test / uat / seed / demo / build / prove_opaque
 ```
 
 环境说明：Gleam 二进制在 `../.toolchain/gleam`（1.19.2，本机 Homebrew 版本过旧），`scripts/env.sh` 会优先使用它，找不到时回退到 PATH，也可用 `GLEAM_BIN` 覆盖；hex 缓存放在 `../.home`（本会话沙箱不允许写 `~/Library/Caches`）。在正常机器上直接 `gleam` 即可。
