@@ -32,6 +32,10 @@ pub type Merged {
   Merged(branch: String, head: String)
 }
 
+pub type DiffEntry {
+  DiffEntry(path: String, kind: String)
+}
+
 pub type Initialized {
   Initialized(project: String, layer: String)
 }
@@ -167,6 +171,21 @@ pub fn unmount(
   )
 }
 
+pub fn diff_branches(
+  bridge: bridge.Bridge,
+  left: String,
+  right: String,
+  timeout: Int,
+) -> Result(List(DiffEntry), bridge.Error) {
+  bridge.call_json(
+    bridge,
+    "diff",
+    [#("branch", json.string(left)), #("with", json.string(right))],
+    diff_decoder(),
+    timeout,
+  )
+}
+
 pub fn merge(
   bridge: bridge.Bridge,
   branch: String,
@@ -289,6 +308,17 @@ fn text_decoder() -> decode.Decoder(String) {
 fn reap_decoder() -> decode.Decoder(List(Reaped)) {
   use items <- decode.field("reaped", decode.list(reaped_decoder()))
   decode.success(items)
+}
+
+fn diff_decoder() -> decode.Decoder(List(DiffEntry)) {
+  use items <- decode.field("items", decode.list(diff_entry_decoder()))
+  decode.success(items)
+}
+
+fn diff_entry_decoder() -> decode.Decoder(DiffEntry) {
+  use path <- decode.field("path", decode.string)
+  use kind <- decode.optional_field("kind", "", decode.string)
+  decode.success(DiffEntry(path, kind))
 }
 
 fn merged_decoder() -> decode.Decoder(Merged) {

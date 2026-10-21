@@ -178,6 +178,14 @@ const ops = {
     return lf.sandbox.status(sb, path);
   },
 
+  async diff({ branch, with: other }) {
+    const page = await clientFor(null).branch.diff_branches(branch, other, 1000);
+    return {
+      items: (page.items ?? []).map((item) => ({ path: item.path, kind: item.kind })),
+      hasMore: !!page.hasMore,
+    };
+  },
+
   async merge({ branch, with: other, name, message, trace }) {
     fireFault("merge");
     return clientFor(trace).branch.merge(branch, other, name, message);

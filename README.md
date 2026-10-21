@@ -12,7 +12,7 @@
 
 ```bash
 cd aegisfleet
-./scripts/test.sh          # 9 个内核测试，跑在真实 LayerFS 模拟器上
+./scripts/test.sh          # 10 个内核测试，跑在真实 LayerFS 模拟器上
 ./scripts/demo.sh          # Race：3 分支赛马，赢家过验证门禁后发布
 ./scripts/build.sh         # 生成独立可执行文件 ./aegisfleet
 ./aegisfleet demo-map-reduce priv/fixture_mr
@@ -131,6 +131,53 @@ PASS: the compiler refused to publish unverified code.
 
 两个算子的“失败”都是值（`AllFailed` / `ShardFailed` / `MergeFailed`），不是异常；命令非零退出是结果而不是拒绝。
 
+### 5. Race 与 Portfolio：杀与不杀
+
+第一版只有 Race：第一个通过验收的分支立即发布，其余立即 kill。这只对“同一目标的等价尝试”成立（flaky 测试重跑、同一修复的不同随机种子、纯搜索）——此时验收命令就是目标本身，先到先得不会丢信息。
+
+“不同实现方案”不满足这个前提：`npm test` 通过只是必要条件；第一个跑完的往往只是**最快**，不是**最好**；杀进程还会丢掉尚未 commit 的中间成果，也让主 Agent 失去比较素材。
+
+因此新增 **Portfolio**（[portfolio.gleam](src/aegis/topologies/portfolio.gleam)）：
+
+| | Race（hedge） | Portfolio |
+| :--- | :--- | :--- |
+| 目标 | 尽快找到一个正确解 | 在多个正确解里选一个 |
+| 何时停 | 第一个 verified | 全部跑完 |
+| 输家进程 | kill | 自然结束，不 kill |
+| Workspace | 立即回收 | 每个 worker 结束时回收 |
+| Branch / Commit | 保留 | 全部保留，供复查 |
+| 发布 | 赢家自动发布 | 默认不发布，`--publish <name>` 才发布 |
+| 输出 | winner + 抢占耗时 | 每个候选的 branch、commit、改动文件、验证耗时、状态 |
+
+关键是把三件事分开：**资源回收**（归还 Workspace）、**信息保留**（不删 Branch/Commit）、**判断**（发布哪一个）。杀进程只应发生在“确认这次尝试不再需要”的时候，而不是“另一个先通过了”的时候。
+
+```bash
+# 全部跑完、全部验证、打印对比，不发布
+./aegisfleet portfolio --verify "node check.js" \
+  a:"printf '42\n' > src/value.txt" \
+  b:"printf '43\n' > src/value.txt" \
+  c:"printf '44\n' > src/value.txt"
+
+# 看完每个分支的改动与验证输出后，再指定发布
+./aegisfleet portfolio --verify "node check.js" --publish c ...
+```
+
+本机输出：
+
+```
+[portfolio] evaluated 3 candidate(s) in 472ms; published pf-c
+  name      branch          commit        changed   check   status
+  a         pf-a            12838c28aca5  1 file(s) 75ms    verified · accepted 42
+      /src/value.txt
+  b         pf-b            125cb047dd56  1 file(s) 59ms    verified · accepted 43
+      /src/value.txt
+  c         pf-c            128b6ce9a72a  1 file(s) 57ms    verified · accepted 44
+      /src/value.txt
+[publish] main updated from pf-c
+```
+
+Race 仍然保留，用于 hedge 场景；它的抢占依然是“杀 worker + 丢弃未提交改动”，已经 commit 的 Branch 会保留——**杀的是资源占用，不是已经产出的候选**。
+
 ---
 
 ## 已验证 / 未验证
@@ -146,6 +193,7 @@ PASS: the compiler refused to publish unverified code.
 | `Busy` 自动退避重试 | `busy_mount_is_retried_test`（注入 2 次 Busy） | `retries >= 2`，租约最终成功 |
 | Race 赢家才发布 | `race_publishes_winner_only_test` | 5s 的 2 个输家在 <1s 内被抢占；`main` = 42 |
 | 全部失败不发布 | `race_without_a_verified_candidate_publishes_nothing_test` | `AllFailed`，`main` 保持 0 |
+| Portfolio 全量评估后才发布 | `portfolio_evaluates_all_before_choosing_test` | 3 个不同实现全部通过、`main` 仍为 0；`--publish c` 后才变 44 |
 | MapReduce 合流 | `map_reduce_merges_independent_shards_test` | 合并分支通过集体验证后发布，`main` 同时含 A/B |
 | 合并冲突 | `map_reduce_conflict_publishes_nothing_test` | `MergeFailed` 含 `Conflict`，`main` 无冲突文件 |
 | 编译期门禁 | `./scripts/prove_opaque.sh` | 编译失败并点名 `VerifiedCommit` |
@@ -210,7 +258,8 @@ aegisfleet/
 ├── priv/
 │   ├── bridge_worker.mjs        # 常驻 Node 桥：帧协议、SDK 调用、trace、janitor
 │   ├── fixture/                 # Race demo 工程（check.js + src/value.txt）
-│   └── fixture_mr/              # MapReduce demo 工程（两个 shard 文件）
+│   ├── fixture_mr/              # MapReduce demo 工程（两个 shard 文件）
+│   └── fixture_portfolio/       # Portfolio demo：42/43/44 三种都算通过
 ├── src/
 │   ├── aegisfleet.gleam         # escript 入口
 │   ├── aegis_native.erl         # Port / env / argv / priv_dir 等 FFI
@@ -225,8 +274,9 @@ aegisfleet/
 │       ├── domain/layer.gleam   # opaque 类型与唯一验证入口
 │       ├── domain/plan.gleam    # Candidate / Shard / FleetPlan ADT
 │       ├── topologies/race.gleam
-│       └── topologies/map_reduce.gleam
-├── test/                        # 9 个 gleeunit 测试
+│       ├── topologies/map_reduce.gleam
+│       └── topologies/portfolio.gleam
+├── test/                        # 10 个 gleeunit 测试
 ├── verify/                      # Node 侧协议与 Collector 契约验证
 ├── integration/                 # lfs.js 补丁与完整文件
 └── scripts/                     # env / test / demo / build / prove_opaque

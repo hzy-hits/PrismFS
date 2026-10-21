@@ -7,6 +7,7 @@ import aegis/domain/plan
 import aegis/native
 import aegis/sdk
 import aegis/topologies/map_reduce
+import aegis/topologies/portfolio
 import aegis/topologies/race
 import aegis/verifier_gate
 import aegis/worker_runner
@@ -31,6 +32,8 @@ pub fn usage() -> String {
   <> "  fleet map-reduce --verify \"<cmd>\" <name>:<command> ...\n"
   <> "                                        parallel shards, then a verified merge\n"
   <> "  fleet demo <fixture-folder>           end-to-end Race proof on a fresh project\n"
+  <> "  fleet portfolio --verify \"<cmd>\" [--publish <name>] <name>:<command> ...\n"
+  <> "                                        run every approach, compare, publish on request\n"
   <> "  fleet demo-map-reduce <fixture>       end-to-end MapReduce proof\n"
   <> "  fleet help\n\n"
   <> "Environment: AEGIS_PROJECT, AEGIS_HOME, AEGIS_SDK, AEGIS_SIM=1 (simulator),\n"
@@ -46,6 +49,7 @@ pub fn run(command: String, args: List(String)) -> Result(Nil, String) {
     "demo" -> command_demo(args)
     "map-reduce" -> command_map_reduce(args)
     "demo-map-reduce" -> command_demo_map_reduce(args)
+    "portfolio" -> command_portfolio(args)
     _ -> Error(usage())
   }
 }
@@ -187,6 +191,64 @@ fn command_run(args: List(String)) -> Result(Nil, String) {
     }
     _ -> Error("usage: fleet run <branch> \"<command>\" [--verify \"<cmd>\"]")
   }
+}
+
+fn command_portfolio(args: List(String)) -> Result(Nil, String) {
+  use cfg <- result.try(load_config())
+  use #(verifier, publish, timeout_ms, candidates) <- result.try(
+    parse_portfolio(args, "", option.None, 120_000, []),
+  )
+  with_fleet(cfg, fn(b, pool) {
+    let opts =
+      portfolio.PortfolioOpts(
+        base: "main",
+        candidates: candidates,
+        verifier: verifier,
+        choose: publish,
+        timeout_ms: timeout_ms,
+        queue_timeout: cfg.queue_timeout,
+        exec_timeout: cfg.exec_timeout,
+        call_timeout: cfg.call_timeout,
+      )
+    use outcome <- result.try(
+      portfolio.run(b, pool, opts) |> result.map_error(identity_error),
+    )
+    io.println("[portfolio] " <> portfolio.outcome_text(outcome))
+    let reports = case outcome {
+      portfolio.Settled(found, _, _) -> found
+      portfolio.TimedOut(found, _) -> found
+    }
+    io.println(
+      "  name      branch          commit        changed   check   status",
+    )
+    list.each(reports, fn(report) {
+      io.println(portfolio.report_line(report))
+      case report.files {
+        [] -> Nil
+        files -> io.println("      " <> string.join(files, ", "))
+      }
+    })
+    use _ <- result.try(case outcome {
+      portfolio.Settled(_, option.Some(commit), _) ->
+        layer.publish(b, commit, cfg.call_timeout)
+        |> result.map(fn(_) {
+          io.println(
+            "[publish] main updated from " <> layer.verified_branch(commit),
+          )
+        })
+        |> result.map_error(bridge.error_text)
+      portfolio.Settled(_, option.None, _) -> {
+        io.println("  nothing published: rerun with --publish <name>")
+        Ok(Nil)
+      }
+      portfolio.TimedOut(_, _) -> {
+        io.println("  nothing published")
+        Ok(Nil)
+      }
+    })
+    report_pool(pool, cfg)
+    Ok(Nil)
+  })
 }
 
 fn command_map_reduce(args: List(String)) -> Result(Nil, String) {
@@ -442,6 +504,51 @@ fn parse_race(
         Ok(#(name, command)) ->
           parse_race(rest, verifier, timeout_ms, [
             plan.Candidate(name, "race-" <> name, command),
+            ..candidates
+          ])
+        Error(Nil) -> Error("candidate " <> spec <> " is not <name>:<command>")
+      }
+  }
+}
+
+fn parse_portfolio(
+  args: List(String),
+  verifier: String,
+  publish: option.Option(String),
+  timeout_ms: Int,
+  candidates: List(plan.Candidate),
+) -> Result(#(String, option.Option(String), Int, List(plan.Candidate)), String) {
+  case args {
+    [] ->
+      case verifier, candidates {
+        "", _ -> Error("portfolio needs --verify \"<command>\"")
+        _, [] ->
+          Error("portfolio needs at least one <name>:<command> candidate")
+        check, found -> Ok(#(check, publish, timeout_ms, list.reverse(found)))
+      }
+    ["--verify", value, ..rest] ->
+      parse_portfolio(rest, value, publish, timeout_ms, candidates)
+    ["--publish", value, ..rest] ->
+      parse_portfolio(
+        rest,
+        verifier,
+        option.Some(value),
+        timeout_ms,
+        candidates,
+      )
+    ["--timeout", value, ..rest] ->
+      parse_portfolio(
+        rest,
+        verifier,
+        publish,
+        int.parse(value) |> result.unwrap(120_000),
+        candidates,
+      )
+    [spec, ..rest] ->
+      case string.split_once(spec, ":") {
+        Ok(#(name, command)) ->
+          parse_portfolio(rest, verifier, publish, timeout_ms, [
+            plan.Candidate(name, "pf-" <> name, command),
             ..candidates
           ])
         Error(Nil) -> Error("candidate " <> spec <> " is not <name>:<command>")
