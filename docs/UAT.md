@@ -3,7 +3,7 @@
 | 项 | 值 |
 | :--- | :--- |
 | 文档版本 | 1.0 |
-| 被测版本 | git `bc005ff`（main-agent decision） |
+| 被测版本 | 代码 `bc005ff`（main-agent decision）· 文档 `1d25903` |
 | 验收环境 | macOS arm64 · Erlang/OTP 28 · Node v22.22.0 · Gleam 1.19.2 · LayerFS 模拟器 |
 | 验收日期 | 2026-10-21（以实际运行环境时钟为准） |
 | 一键验收 | `./scripts/uat.sh` → 本次 **PASS=24 FAIL=0** |
@@ -51,6 +51,13 @@ source scripts/env.sh     # 设置临时 home、模拟器 SDK、trace 目录
 
 `scripts/env.sh` 会创建临时 LayerFS home，所有用例都不会触碰你正在运行的 DSH 实例。
 
+手动用例可以先创建一个一次性项目（命令会打印要 eval 的 exports）：
+
+```bash
+eval "$(./scripts/seed.sh priv/fixture_portfolio uat-pf)"
+./aegisfleet portfolio --verify "$(command -v node) check.js" a:… b:… c:…
+```
+
 ### 3.3 一键验收
 
 ```bash
@@ -95,7 +102,7 @@ source scripts/env.sh     # 设置临时 home、模拟器 SDK、trace 目录
 | :--- | :--- | :--- | :--- | :--- |
 | UAT-12 | DSH Collector 能读舰队 trace | `node verify/collector_contract.mjs` | `collector accepted 5 fleet trace lines` | PASS |
 | UAT-13 | 残留挂载 janitor | `node verify/leak_reap.mjs` | `reap: { reaped: [...] }`，之后 `snapshot after reap: []` | PASS |
-| UAT-14 | `lfs.js` 补丁可应用 | `git -C "$LAYERFS_DIR" apply --check integration/lfs-fleet.patch` | 退出 0 | PASS |
+| UAT-14 | `lfs.js` 补丁可应用 | `git -C "$LAYERFS_DIR" apply --check integration/lfs-fleet.patch` | 退出 0 | PASS（仅证明可应用；运行中的 DSH 仍需手动应用并设置 `AEGIS_FLEET_BIN`） |
 
 ### E. Portfolio：全量评估、包不发布
 
