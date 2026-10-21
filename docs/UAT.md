@@ -3,7 +3,7 @@
 | 项 | 值 |
 | :--- | :--- |
 | 文档版本 | 1.0 |
-| 被测版本 | 代码 `bc005ff`（main-agent decision）· 文档 `1d25903` |
+| 被测版本 | 代码 `bc005ff`（main-agent decision）· 文档 `1f69738` |
 | 验收环境 | macOS arm64 · Erlang/OTP 28 · Node v22.22.0 · Gleam 1.19.2 · LayerFS 模拟器 |
 | 验收日期 | 2026-10-21（以实际运行环境时钟为准） |
 | 一键验收 | `./scripts/uat.sh` → 本次 **PASS=24 FAIL=0** |
