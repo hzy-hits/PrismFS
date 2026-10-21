@@ -38,8 +38,8 @@
 
 - Erlang/OTP **28**（`erl` 可用）
 - Node.js **≥ 22**
-- 一个 LayerFS checkout（默认 `/Users/huangzhenyu/Projects/layerfs`，用 `LAYERFS_DIR` 覆盖）
-- Gleam：`scripts/env.sh` 优先使用 `../.toolchain/gleam`（1.19.2），否则 PATH 上的 `gleam`；可用 `GLEAM_BIN` 覆盖
+- Gleam **≥ 1.14**（`gleam` 在 PATH 上，或通过 `GLEAM_BIN` 指定）
+- LayerFS 仓库（默认通过仓库根目录 `./layerfs` 软链接关联，或用 `LAYERFS_DIR` 覆盖）
 
 ### 3.2 一键准备
 

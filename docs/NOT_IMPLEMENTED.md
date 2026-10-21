@@ -231,8 +231,7 @@ Race、MapReduce、Portfolio 已实现，但：
 ### 9.4 打包与 CI（未实现）
 
 - 交付物是源码 + `scripts/build.sh` 生成的 escript；没有 Docker 镜像、没有签名发布、没有 CI。
-- `.github/workflows/test.yml` 已删除：默认 CI 环境没有 LayerFS checkout，跑不了集成测试；加 CI 需要先解决依赖。
-- Gleam 1.19.2 在 `../.toolchain`，hex 缓存在 `../.home`——这是本会话的沙箱变通，不是标准安装方式。
+- 默认 CI 环境若不包含 LayerFS 仓库，集成测试需先挂载或拉取 LayerFS 依赖。
 
 ---
 

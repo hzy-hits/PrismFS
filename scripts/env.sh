@@ -43,8 +43,6 @@ export AEGIS_BRIDGE="$AEGIS_ROOT/priv/bridge_worker.mjs"
 export AEGIS_TRACE_DIR="${AEGIS_TRACE_DIR:-$AEGIS_HOME/traces}"
 export AEGIS_FIXTURE="${AEGIS_FIXTURE:-$AEGIS_ROOT/priv/fixture}"
 export AEGIS_FIXTURE_MR="${AEGIS_FIXTURE_MR:-$AEGIS_ROOT/priv/fixture_mr}"
-# This session's sandbox cannot write ~/Library/Caches, so a local hex cache
-# is used when one was prepared; a normal machine keeps its own HOME.
-if [ -d "$AEGIS_ROOT/../.home" ] || [ -n "${AEGIS_GLEAM_HOME:-}" ]; then
-  export HOME="${AEGIS_GLEAM_HOME:-$AEGIS_ROOT/../.home}"
+if [ -n "${AEGIS_GLEAM_HOME:-}" ]; then
+  export HOME="$AEGIS_GLEAM_HOME"
 fi
