@@ -31,6 +31,7 @@ pub fn race_publishes_winner_only_test() {
         ),
       ],
       verifier: fleet.config.node <> " check.js",
+      publish: True,
       timeout_ms: 30_000,
       queue_timeout: fleet.config.queue_timeout,
       exec_timeout: fleet.config.exec_timeout,
@@ -38,7 +39,7 @@ pub fn race_publishes_winner_only_test() {
     )
   let assert Ok(outcome) = race.run(fleet.bridge, fleet.pool, opts)
   case outcome {
-    race.Won(winner, losers, preempted_in_ms, total_ms) -> {
+    race.Won(winner, losers, preempted_in_ms, _published, total_ms) -> {
       assert layer.verified_branch(winner) == "race-fast"
       assert list.length(losers) == 2
       // the losers were sleeping 5s; BEAM-side preemption must be far below that
@@ -76,6 +77,7 @@ pub fn race_without_a_verified_candidate_publishes_nothing_test() {
         plan.Candidate("noop", "racebad-2", "true"),
       ],
       verifier: fleet.config.node <> " check.js",
+      publish: False,
       timeout_ms: 30_000,
       queue_timeout: fleet.config.queue_timeout,
       exec_timeout: fleet.config.exec_timeout,
@@ -100,5 +102,62 @@ pub fn race_without_a_verified_candidate_publishes_nothing_test() {
     fn() { aegis_test_helper.in_use(fleet) == 0 },
     5000,
   )
+  aegis_test_helper.stop(fleet)
+}
+
+/// The same race, but no topology publishes: the winner is reported and the
+/// caller (the main agent) makes the publish call.
+pub fn race_reports_winner_without_publishing_test() {
+  let fleet = aegis_test_helper.start("racedecide", 16)
+  let opts =
+    race.RaceOpts(
+      base: "main",
+      candidates: [
+        plan.Candidate(
+          "fast",
+          "racedecide-fast",
+          "sleep 0.05; printf '42\\n' > src/value.txt",
+        ),
+        plan.Candidate(
+          "slow",
+          "racedecide-slow",
+          "sleep 5; printf '41\\n' > src/value.txt",
+        ),
+      ],
+      verifier: fleet.config.node <> " check.js",
+      publish: False,
+      timeout_ms: 30_000,
+      queue_timeout: fleet.config.queue_timeout,
+      exec_timeout: fleet.config.exec_timeout,
+      publish_timeout: fleet.config.call_timeout,
+    )
+  let assert Ok(outcome) = race.run(fleet.bridge, fleet.pool, opts)
+  let winner = case outcome {
+    race.Won(winner, _, _, published, _) -> {
+      assert published == False
+      winner
+    }
+    _other -> panic as "expected a winner"
+  }
+  let assert Ok(before) =
+    sdk.read_text(
+      fleet.bridge,
+      "main",
+      "/src/value.txt",
+      fleet.config.call_timeout,
+    )
+  assert string.trim(before) == "0"
+
+  // The main agent decides; the kernel only produced the VerifiedCommit.
+  let assert Ok(Nil) =
+    layer.publish(fleet.bridge, winner, fleet.config.call_timeout)
+  let assert Ok(after) =
+    sdk.read_text(
+      fleet.bridge,
+      "main",
+      "/src/value.txt",
+      fleet.config.call_timeout,
+    )
+  assert string.trim(after) == "42"
   aegis_test_helper.stop(fleet)
 }

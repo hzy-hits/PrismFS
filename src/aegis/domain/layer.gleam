@@ -129,7 +129,7 @@ pub fn publish(
   commit: VerifiedCommit,
   timeout: Int,
 ) -> Result(Nil, bridge.Error) {
-  sdk.publish(bridge, commit.branch, "fleet", timeout)
+  sdk.publish(bridge, commit.branch, commit.commit_id, "fleet", timeout)
 }
 
 @external(erlang, "erlang", "integer_to_binary")

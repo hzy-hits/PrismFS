@@ -20,6 +20,8 @@ pub type MapReduceOpts {
     base: String,
     shards: List(plan.Shard),
     verifier: String,
+    /// Publish the merged Branch? Only a caller that has already decided passes True.
+    publish: Bool,
     timeout_ms: Int,
     queue_timeout: Int,
     exec_timeout: Int,
@@ -28,7 +30,13 @@ pub type MapReduceOpts {
 }
 
 pub type MapReduceOutcome {
-  Merged(branch: String, commit: String, shards: List(String), total_ms: Int)
+  Merged(
+    branch: String,
+    commit: String,
+    shards: List(String),
+    published: Bool,
+    total_ms: Int,
+  )
   ShardFailed(shard: String, reason: String)
   MergeFailed(branch: String, with: String, reason: String)
   TimedOut(seen: Int)
@@ -36,14 +44,19 @@ pub type MapReduceOutcome {
 
 pub fn outcome_text(outcome: MapReduceOutcome) -> String {
   case outcome {
-    Merged(branch, commit, shards, total_ms) ->
+    Merged(branch, commit, shards, published, total_ms) ->
       "merged "
       <> int.to_string(list.length(shards))
       <> " shard(s) into "
       <> branch
       <> " (commit "
       <> short(commit)
-      <> "), verified and published to main in "
+      <> "), "
+      <> case published {
+        True -> "verified and published to main"
+        False -> "verified; NOT published (caller decides)"
+      }
+      <> " in "
       <> int.to_string(total_ms)
       <> "ms"
     ShardFailed(shard, reason) -> "shard " <> shard <> " failed: " <> reason
@@ -225,23 +238,41 @@ fn finish(
                     layer.verification_error_text(error),
                   ))
                 Ok(verified_merged) ->
-                  case
-                    layer.publish(bridge, verified_merged, opts.call_timeout)
-                  {
-                    Ok(Nil) ->
+                  case opts.publish {
+                    False ->
                       Ok(Merged(
                         branch: branch,
                         commit: commit,
                         shards: list.map(opts.shards, fn(shard) { shard.name }),
+                        published: False,
                         total_ms: native.monotonic_ms() - started,
                       ))
-                    Error(error) ->
-                      Error(
-                        "publishing "
-                        <> branch
-                        <> ": "
-                        <> bridge.error_text(error),
-                      )
+                    True ->
+                      case
+                        layer.publish(
+                          bridge,
+                          verified_merged,
+                          opts.call_timeout,
+                        )
+                      {
+                        Ok(Nil) ->
+                          Ok(Merged(
+                            branch: branch,
+                            commit: commit,
+                            shards: list.map(opts.shards, fn(shard) {
+                              shard.name
+                            }),
+                            published: True,
+                            total_ms: native.monotonic_ms() - started,
+                          ))
+                        Error(error) ->
+                          Error(
+                            "publishing "
+                            <> branch
+                            <> ": "
+                            <> bridge.error_text(error),
+                          )
+                      }
                   }
               }
             }

@@ -9,7 +9,7 @@ import gleam/json
 import gleam/option.{type Option, unwrap}
 
 pub type BranchInfo {
-  BranchInfo(name: String, head: Option(String))
+  BranchInfo(name: String, base: String, head: Option(String))
 }
 
 pub type Forked {
@@ -211,13 +211,18 @@ pub fn merge(
 pub fn publish(
   bridge: bridge.Bridge,
   branch: String,
+  commit: String,
   trace: String,
   timeout: Int,
 ) -> Result(Nil, bridge.Error) {
   bridge.call_json(
     bridge,
     "publish",
-    [#("branch", json.string(branch)), #("trace", json.string(trace))],
+    [
+      #("branch", json.string(branch)),
+      #("commit", json.string(commit)),
+      #("trace", json.string(trace)),
+    ],
     decode.success(Nil),
     timeout,
   )
@@ -263,8 +268,9 @@ pub fn reap(
 
 fn branch_decoder() -> decode.Decoder(BranchInfo) {
   use name <- decode.field("name", decode.string)
+  use base <- decode.optional_field("base", "", decode.string)
   use head <- decode.field("head", decode.optional(decode.string))
-  decode.success(BranchInfo(name, head))
+  decode.success(BranchInfo(name, base, head))
 }
 
 fn forked_decoder() -> decode.Decoder(Forked) {

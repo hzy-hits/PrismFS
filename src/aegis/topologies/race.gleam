@@ -21,6 +21,8 @@ pub type RaceOpts {
     base: String,
     candidates: List(plan.Candidate),
     verifier: String,
+    /// Publish the winner? Only a caller that has already decided passes True.
+    publish: Bool,
     timeout_ms: Int,
     queue_timeout: Int,
     exec_timeout: Int,
@@ -33,6 +35,7 @@ pub type RaceOutcome {
     winner: layer.VerifiedCommit,
     losers: List(String),
     preempted_in_ms: Int,
+    published: Bool,
     total_ms: Int,
   )
   AllFailed(failures: List(#(String, String)))
@@ -41,12 +44,12 @@ pub type RaceOutcome {
 
 pub fn outcome_text(outcome: RaceOutcome) -> String {
   case outcome {
-    Won(winner, losers, preempted_in_ms, total_ms) ->
+    Won(winner, losers, preempted_in_ms, published, total_ms) ->
       "winner "
       <> layer.verified_branch(winner)
       <> " (commit "
       <> layer.verified_commit_id(winner)
-      <> ") published to main; killed "
+      <> "); killed "
       <> int.to_string(list.length(losers))
       <> " loser(s) in "
       <> case preempted_in_ms {
@@ -56,6 +59,10 @@ pub fn outcome_text(outcome: RaceOutcome) -> String {
       <> "; race took "
       <> int.to_string(total_ms)
       <> "ms"
+      <> case published {
+        True -> "; published to main"
+        False -> "; NOT published (caller decides)"
+      }
     AllFailed(failures) ->
       "every candidate failed:\n"
       <> string.join(
@@ -206,21 +213,33 @@ fn wait(
           kill_all(others)
           let preempted_in_ms =
             await_preemption(state.selector, others, killed_at, 1000)
-          case layer.publish(bridge, winner, opts.publish_timeout) {
-            Ok(Nil) ->
+          case opts.publish {
+            False ->
               Ok(Won(
                 winner: winner,
                 losers: losers,
                 preempted_in_ms: preempted_in_ms,
+                published: False,
                 total_ms: native.monotonic_ms() - state.started,
               ))
-            Error(error) ->
-              Error(
-                "publishing "
-                <> layer.verified_branch(winner)
-                <> ": "
-                <> bridge.error_text(error),
-              )
+            True ->
+              case layer.publish(bridge, winner, opts.publish_timeout) {
+                Ok(Nil) ->
+                  Ok(Won(
+                    winner: winner,
+                    losers: losers,
+                    preempted_in_ms: preempted_in_ms,
+                    published: True,
+                    total_ms: native.monotonic_ms() - state.started,
+                  ))
+                Error(error) ->
+                  Error(
+                    "publishing "
+                    <> layer.verified_branch(winner)
+                    <> ": "
+                    <> bridge.error_text(error),
+                  )
+              }
           }
         }
         Ok(Job(Lost(name, reason))) -> {

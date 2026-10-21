@@ -191,9 +191,9 @@ const ops = {
     return clientFor(trace).branch.merge(branch, other, name, message);
   },
 
-  async publish({ branch, trace }) {
+  async publish({ branch, commit, trace }) {
     fireFault("publish");
-    return clientFor(trace).branch.publish(branch);
+    return clientFor(trace).branch.publish(branch, commit || undefined);
   },
 
   async read({ branch, path }) {

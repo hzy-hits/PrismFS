@@ -20,7 +20,6 @@ import aegis/workspace_pool
 import gleam/erlang/process
 import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some}
 import gleam/string
 
 pub type PortfolioOpts {
@@ -28,8 +27,6 @@ pub type PortfolioOpts {
     base: String,
     candidates: List(plan.Candidate),
     verifier: String,
-    /// The candidate to publish after the comparison; None publishes nothing.
-    choose: Option(String),
     timeout_ms: Int,
     queue_timeout: Int,
     exec_timeout: Int,
@@ -53,7 +50,8 @@ pub type Report {
 pub type PortfolioOutcome {
   Settled(
     reports: List(Report),
-    chosen: Option(layer.VerifiedCommit),
+    /// Every verified candidate, for the caller to choose from.
+    verified: List(layer.VerifiedCommit),
     total_ms: Int,
   )
   TimedOut(reports: List(Report), total_ms: Int)
@@ -61,16 +59,14 @@ pub type PortfolioOutcome {
 
 pub fn outcome_text(outcome: PortfolioOutcome) -> String {
   case outcome {
-    Settled(reports, chosen, total_ms) ->
+    Settled(reports, verified, total_ms) ->
       "evaluated "
       <> int.to_string(list.length(reports))
       <> " candidate(s) in "
       <> int.to_string(total_ms)
       <> "ms; "
-      <> case chosen {
-        Some(commit) -> "published " <> layer.verified_branch(commit)
-        None -> "nothing published (caller chooses)"
-      }
+      <> int.to_string(list.length(verified))
+      <> " verified; nothing published"
     TimedOut(reports, total_ms) ->
       "timed out after "
       <> int.to_string(total_ms)
@@ -282,24 +278,11 @@ fn finish(
   case timed_out {
     True -> Ok(TimedOut(reports, total_ms))
     False ->
-      case chosen(verified, opts.choose) {
-        Error(reason) -> Error(reason)
-        Ok(commit) -> Ok(Settled(reports, commit, total_ms))
-      }
-  }
-}
-
-fn chosen(
-  verified: List(#(String, layer.VerifiedCommit)),
-  choose: Option(String),
-) -> Result(Option(layer.VerifiedCommit), String) {
-  case choose {
-    None -> Ok(None)
-    Some(name) ->
-      case list.find(verified, fn(pair) { pair.0 == name }) {
-        Ok(found) -> Ok(Some(found.1))
-        Error(Nil) -> Error("no verified candidate named " <> name)
-      }
+      Ok(Settled(
+        reports: reports,
+        verified: list.map(verified, fn(pair) { pair.1 }),
+        total_ms: total_ms,
+      ))
   }
 }
 

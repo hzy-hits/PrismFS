@@ -26,6 +26,7 @@ pub fn map_reduce_merges_independent_shards_test() {
         ),
       ],
       verifier: fleet.config.node <> " check.js",
+      publish: True,
       timeout_ms: 30_000,
       queue_timeout: fleet.config.queue_timeout,
       exec_timeout: fleet.config.exec_timeout,
@@ -33,7 +34,7 @@ pub fn map_reduce_merges_independent_shards_test() {
     )
   let assert Ok(outcome) = map_reduce.run(fleet.bridge, fleet.pool, opts)
   case outcome {
-    map_reduce.Merged(_branch, _commit, shards, total_ms) -> {
+    map_reduce.Merged(_branch, _commit, shards, _published, total_ms) -> {
       assert shards == ["a", "b"]
       assert total_ms < 10_000
     }
@@ -74,6 +75,7 @@ pub fn map_reduce_conflict_publishes_nothing_test() {
         ),
       ],
       verifier: fleet.config.node <> " check.js",
+      publish: True,
       timeout_ms: 30_000,
       queue_timeout: fleet.config.queue_timeout,
       exec_timeout: fleet.config.exec_timeout,

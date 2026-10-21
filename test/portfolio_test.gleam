@@ -4,7 +4,6 @@ import aegis/sdk
 import aegis/topologies/portfolio
 import aegis_test_helper
 import gleam/list
-import gleam/option.{Some}
 import gleam/string
 
 /// Three different, all-valid implementations: every one runs to completion,
@@ -34,24 +33,25 @@ pub fn portfolio_evaluates_all_before_choosing_test() {
         ),
       ],
       verifier: fleet.config.node <> " check.js",
-      choose: Some("c"),
       timeout_ms: 30_000,
       queue_timeout: fleet.config.queue_timeout,
       exec_timeout: fleet.config.exec_timeout,
       call_timeout: fleet.config.call_timeout,
     )
   let assert Ok(outcome) = portfolio.run(fleet.bridge, fleet.pool, opts)
-  let assert portfolio.Settled(reports, chosen, total_ms) = outcome
+  let assert portfolio.Settled(reports, verified, total_ms) = outcome
   assert list.length(reports) == 3
-  let verified =
+  let verified_reports =
     list.filter(reports, fn(report) { report.status == "verified" })
-  assert list.length(verified) == 3
+  assert list.length(verified_reports) == 3
   list.each(reports, fn(report) {
     assert report.changed == 1
   })
   assert total_ms < 10_000
-  let assert Some(commit) = chosen
-  assert layer.verified_branch(commit) == "pf-c"
+  let assert Ok(commit) =
+    list.find(verified, fn(candidate) {
+      layer.verified_branch(candidate) == "pf-c"
+    })
 
   // Still nothing published: evaluation is not selection.
   let assert Ok(before) =
