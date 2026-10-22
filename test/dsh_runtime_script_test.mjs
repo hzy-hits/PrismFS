@@ -18,7 +18,8 @@ function fixture(t) {
   mkdirSync(tests, { recursive: true });
   // Only runtime shell utilities are visible; Gleam cannot be found on PATH.
   for (const command of ["dirname", "mktemp", "rm", "cp", "tr"]) {
-    symlinkSync(`/usr/bin/${command}`, join(bin, command));
+    const source = existsSync(`/bin/${command}`) ? `/bin/${command}` : `/usr/bin/${command}`;
+    symlinkSync(source, join(bin, command));
   }
   const sdk = join(root, "sdk.js");
   writeFileSync(sdk, "");

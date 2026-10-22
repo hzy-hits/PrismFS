@@ -1101,7 +1101,7 @@ fn with_fleet(
     }),
   )
   use _hello <- result.try(
-    sdk.hello(b, cfg.call_timeout)
+    sdk.hello(b, int.max(cfg.call_timeout, 5000))
     |> result.map_error(fn(error) {
       "the bridge did not answer: " <> bridge.error_text(error)
     }),

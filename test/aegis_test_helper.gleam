@@ -119,7 +119,7 @@ fn start_with_sdk(
     Ok(found) -> found
     Error(reason) -> fail("bridge: ", reason)
   }
-  case sdk.hello(bridge, config.call_timeout) {
+  case sdk.hello(bridge, int.max(config.call_timeout, 5000)) {
     Ok(Nil) -> Nil
     Error(error) -> fail("hello: ", bridge.error_text(error))
   }

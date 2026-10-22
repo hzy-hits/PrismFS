@@ -25,7 +25,7 @@ trap 'rm -f "$OUT"' EXIT
 "$GLEAM_BIN" format --check src test >"$OUT" 2>&1 && pass "UAT-02 formatted" || fail "UAT-02 formatted"
 
 ./scripts/test.sh >"$OUT" 2>&1
-expect "UAT-03 kernel tests (19)" "19 passed, no failures" "$OUT"
+expect "UAT-03 kernel tests (33)" "33 passed, no failures" "$OUT"
 
 ./scripts/prove_opaque.sh >"$OUT" 2>&1
 expect "UAT-04 compile-time gate" "PASS: the compiler refused" "$OUT"
