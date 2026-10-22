@@ -177,3 +177,80 @@ pub fn queue_timeout_refuses_waiter_test() {
   )
   aegis_test_helper.stop(fleet)
 }
+
+/// The caller's own deadline cancels its queued identity. Freeing a slot later
+/// must not grant a Workspace to the timed-out caller.
+pub fn checkout_deadline_cancels_handoff_test() {
+  let fleet =
+    aegis_test_helper.start_full(
+      "checkout-cancel",
+      1,
+      "priv/fixture",
+      option.Some(5000),
+    )
+  let assert Ok(_) =
+    sdk.fork(fleet.bridge, "cancel-branch", "main", "tester", 5000)
+  let events = process.new_subject()
+  let holder =
+    aegis_test_helper.stuck_worker(fleet, "cancel-branch", "holder", events)
+  let assert Ok(Ok(_)) = process.receive(events, 5000)
+
+  let assert Error(workspace_pool.QueueTimeout(_, _)) =
+    workspace_pool.checkout(
+      fleet.pool,
+      "cancel-branch",
+      "cancelled",
+      "cancelled",
+      25,
+    )
+  assert aegis_test_helper.wait_until(
+    fn() { aegis_test_helper.stats(fleet).queued == 0 },
+    1000,
+  )
+
+  process.kill(holder)
+  assert aegis_test_helper.wait_until(
+    fn() { aegis_test_helper.in_use(fleet) == 0 },
+    5000,
+  )
+  aegis_test_helper.stop(fleet)
+}
+
+/// A refused unmount keeps the slot owned. Drain waits through the scheduled
+/// retry and only succeeds after the bridge confirms cleanup.
+pub fn drain_retries_failed_release_without_freeing_slot_test() {
+  let fleet = aegis_test_helper.start("drain-release", 1)
+  let assert Ok(_) =
+    sdk.fork(fleet.bridge, "drain-branch", "main", "tester", 5000)
+  let events = process.new_subject()
+  let worker =
+    aegis_test_helper.stuck_worker(fleet, "drain-branch", "holder", events)
+  let assert Ok(Ok(_)) = process.receive(events, 5000)
+  let assert Ok(Nil) = unmount_fault(fleet)
+  process.kill(worker)
+
+  assert aegis_test_helper.wait_until(
+    fn() { aegis_test_helper.stats(fleet).retries >= 1 },
+    5000,
+  )
+  assert aegis_test_helper.in_use(fleet) == 1
+  let assert Ok(drained) = workspace_pool.drain(fleet.pool, 5000)
+  assert drained.in_use == 0
+  assert drained.unmounted == 1
+  assert drained.reclaimed == 1
+  let assert Ok(Nil) = bridge.shutdown(fleet.bridge, 5000)
+}
+
+fn unmount_fault(fleet: aegis_test_helper.Fleet) -> Result(Nil, bridge.Error) {
+  bridge.call_json(
+    fleet.bridge,
+    "faults",
+    [
+      #("op", json.string("unmount")),
+      #("code", json.string("Busy")),
+      #("times", json.int(1)),
+    ],
+    decode.success(Nil),
+    5000,
+  )
+}

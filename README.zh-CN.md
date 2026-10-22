@@ -6,10 +6,10 @@
 
 **PrismFS**（内核包名 `aegisfleet`）是一个基于 **Gleam (Erlang/OTP 28)** 构建、运行于 **[LayerFS](layerfs)** 之上的确定性多 Agent 舰队并发控制面（Deterministic Fleet Control Plane）。
 
-它将原本交由大模型在 Bash 中手写内联脚本维护的脆弱流程（`mount → exec → commit → unmount`、`finally` 兜底及手动遍历卸载残留挂载点），替换为具备编译期类型门禁、OTP 进程级监督与毫秒级自动回收能力的确定性控制内核：
-- **进程级 RAII 工作区租约（Workspace Pool）**：统一托管 Sandbox 的 16 个 Workspace 槽位，当 Worker 进程崩溃、超时或在赛马中被强杀时，自动触发 `unmount(discard: true)` 释放槽位，实现零资源泄漏。
-- **编译期验证门禁（Opaque Verification Gate）**：通过不透明类型 `UnverifiedCommit` 与 `VerifiedCommit` 在编译期锁死主干发布路径——未经独立验证环境测试通过的代码在编译期即无法传入 `publish`。
-- **三大确定性拓扑算子**：内置 **`Race`**（先到先得抢占式对冲）、**`MapReduce`**（正交分片并行施工与三方自动合并）、以及 **`Portfolio`**（多实现方案全量评估与比选）。
+它将原本交由大模型在 Bash 中手写内联脚本维护的流程替换为确定性控制内核：
+- **进程级 Workspace 租约（Workspace Pool）**：Worker 崩溃、超时或被抢占时触发 `unmount(discard: true)`；只有底层明确确认成功后才归还槽位。
+- **不可变快照验证门禁（Opaque Verification Gate）**：opaque type 禁止把 `UnverifiedCommit` 传给 `layer.publish`；门禁验证精确 Commit ID，最终发布仍依赖 LayerFS CAS。
+- **三大确定性拓扑算子**：内置 **`Race`**（先到先得的协作取消对冲）、**`MapReduce`**（正交分片并行施工与三方自动合并）、以及 **`Portfolio`**（多实现方案全量评估与比选）。
 - **主 Agent 决策主权（Main-Agent Sovereignty）**：所有拓扑默认均不擅自修改 `main`，而是向主 Agent 输出包含分支、Commit、改动文件列表与测试耗时的结构化决策包（Decision Packet），由主 Agent 或用户拍板后通过带 CAS 防篡改校验的 `publish` 显式发布。
 
 ---
@@ -70,21 +70,23 @@ flowchart LR
 | :--- | :--- |
 | **16 槽位已满** | `checkout` 请求进入 FIFO 队列等待，每个排队请求拥有独立超时保护（`QueueTimeout`）。 |
 | **`Busy` / `Capacity` 瞬时拒绝** | 保持槽位预留，自动按指数退避策略（`200ms → 400ms → 800ms…`，上限 `5s`）重试挂载。 |
-| **Worker 崩溃或被抢占终止** | 独立 Watcher 进程收到 Erlang `DOWN` 信号 $\rightarrow$ 立即执行 `unmount(path, discard: true)` $\rightarrow$ 毫秒级归还槽位。 |
-| **Mount 飞行途中 Worker 死亡** | 租约标记为 `released`，待底层 `mount` 返回后立即自动卸载并丢弃。 |
+| **Worker 崩溃或被抢占终止** | 独立 Watcher 收到 Erlang `DOWN` 后请求 `unmount(path, discard: true)`；确认成功后才归还槽位。 |
+| **Mount 飞行途中 Worker 死亡** | 租约标记为 `released`；待底层 `mount` 返回后请求卸载并丢弃，确认成功后才释放所有权。 |
+| **Mount/Unmount 结果未知** | 保留槽位、Owner、路径/意图（若已知）及错误并隔离；不对不确定操作并发重试。 |
+| **关闭** | Drain 停止接单、拒绝队列并等待晚到回复与卸载重试；超时显式报告未清理资源。 |
 | **异常残留挂载清理** | `reap` 命令自动巡检并仅卸载处于 `Idle` 状态且无未提交改动的安全挂载点。 |
 | **长时挂死租约回收** | 周期性触发 `Sweep` 扫描，强制回收超过 `lease_ttl_ms` 的僵尸租约。 |
 
 ### 3. 编译期验证门禁 (`aegis/domain/layer`)
 - 任何 Worker 执行命令仅能产出 `UnverifiedCommit`。
-- `VerifiedCommit` 的构造器为模块私有，唯一构造入口 `verify()` 必须在独立、干净的丢弃型 Workspace 中跑通验证命令（退出码为 `0`）后方可返回。
-- `layer.publish()` 在类型签名上仅接受 `VerifiedCommit`——任何试图直接发布未验证分支的代码均无法通过 Gleam 编译器检查（由 `./scripts/prove_opaque.sh` 持续验证）。
+- `VerifiedCommit` 的构造器为模块私有。`VerifierGate` 从候选的不可变 Commit ID 创建私有 `verify-*` Branch 后执行验证；旧版 SDK 没有安全删除原语，因此这些证明 Branch 会保留。
+- `layer.publish()` 仅接受 `VerifiedCommit`；传入 `UnverifiedCommit` 会产生编译错误，并由 `./scripts/prove_opaque.sh` 检查。该证明只覆盖进程内 API 路径，不代表任意 SDK 调用或 daemon/进程故障都能被内核兜底。
 
 ### 4. 三大并发拓扑算子 (`Race` · `MapReduce` · `Portfolio`)
 
 | 算子 | 适用场景 | 终止条件 | 失败/慢分支处理策略 |
 | :--- | :--- | :--- | :--- |
-| **`Race`** | 同一目标的等价竞速尝试（对冲长尾延迟） | 第一个通过 `VerifierGate` 的分支诞生 | 其余正在运行的 Worker 在 `<1ms` 内被强杀并丢弃未提交工作区，已提交历史保留。 |
+| **`Race`** | 同一目标的等价竞速尝试（对冲长尾延迟） | 第一个通过 `VerifierGate` 的分支诞生 | 其余 Worker 收到取消请求；未提交工作区在确认卸载后丢弃，已提交历史保留。 |
 | **`MapReduce`** | 正交模块分片并行重构与合流 | 所有分片各自过检 $\rightarrow$ 折叠合并 $\rightarrow$ 合并分支再次过检 | 保留各分片分支；若发生三方合并冲突则安全中止并返回 `MergeFailed`。 |
 | **`Portfolio`** | 不同实现方案的全量对比评估 | 所有候选方案均完成执行与验证 | 不提前强杀任何分支；输出完整对比报表与机器可读的 `[packet]` JSON 决策包。 |
 
@@ -100,12 +102,16 @@ flowchart LR
 ### 环境依赖
 - **Erlang/OTP** $\ge$ 28
 - **Gleam** $\ge$ 1.14
-- **Node.js** $\ge$ 22
-- **LayerFS** 仓库（已通过仓库根目录软链接 [`./layerfs`](layerfs) 关联，或通过环境变量 `LAYERFS_DIR` 指定）
+- **Node.js** $\ge$ 22.19
+- **LayerFS**：使用 [`layerfs.revision`](layerfs.revision) 记录的固定兼容版本
 
 ### 构建与验证
 
 ```bash
+# 拉取兼容的旧版 simulator SDK 并安装其 workspace 依赖。
+# 可用 LAYERFS_DIR 指向独立 checkout；脚本不会移动已有 checkout。
+./scripts/bootstrap-layerfs.sh
+
 # 1. 编译生成独立可执行文件 (./aegisfleet)
 ./scripts/build.sh
 
@@ -121,6 +127,11 @@ flowchart LR
 ./scripts/prove_opaque.sh
 ```
 
+`scripts/env.sh` 会在执行前校验 LayerFS 的精确 revision。新版 LayerFS
+`main` 已改用 Workspace API，本项目会明确拒绝而不是静默调用不兼容的旧版
+`sandbox.mount/exec/commit/unmount`。不可取消的 SDK 调用可能延迟优雅 drain；
+强杀恢复以及 daemon/bridge 进程死亡后的资源恢复不在当前保证范围内。
+
 ### CLI 命令速查
 
 ```text
@@ -128,7 +139,7 @@ usage:
   aegisfleet status                          查看项目、分支列表与当前挂载的工作区
   aegisfleet reap                            安全卸载所有处于 Idle 且干净的残留工作区
   aegisfleet race [--publish] --verify "<cmd>" <name>:<command> ...
-                                             赛马模式：第一个通过验证的分支胜出并抢占其余分支
+                                             赛马模式：第一个通过验证的分支胜出并请求取消其余分支
   aegisfleet map-reduce [--publish] --verify "<cmd>" <name>:<command> ...
                                              分治模式：多分支并行施工、折叠合并并统一验证
   aegisfleet portfolio --verify "<cmd>" <name>:<command> ...

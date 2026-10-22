@@ -1,7 +1,7 @@
 # AegisFleet：基于 Gleam (BEAM) × LayerFS × DSH 的多 Agent 舰队架构与工程设计文档
 
 > [!IMPORTANT]
-> **核心定位**：保留 **LayerFS** 的底层毫秒级 CoW 分支与沙箱底座（手脚），保留 **DSH Web** 的交互对话与 DAG 实时可视化面板（眼睛），用 **Gleam (Erlang/OTP 28)** 彻底替换当前靠 75 行 System Prompt 让大模型手搓脚本的脆弱中间层，打造一个**类型安全、崩溃自愈、零资源泄漏的确定性多 Agent 并发控制面（Deterministic Fleet Control Plane）**。
+> **核心定位**：保留 **LayerFS** 的底层 CoW 分支与沙箱底座（手脚），保留 **DSH Web** 的交互对话与 DAG 实时可视化面板（眼睛），用 **Gleam (Erlang/OTP 28)** 彻底替换当前靠 75 行 System Prompt 让大模型手搓脚本的脆弱中间层，打造一个**类型安全、具备显式未知状态与排空协议的确定性多 Agent 并发控制面（Deterministic Fleet Control Plane）**。
 
 ---
 
@@ -12,7 +12,7 @@
 | 层级 | 现有实现模块 | 源码审计结论 | 核心痛点与工程瓶颈 |
 | :--- | :--- | :--- | :--- |
 | **展示与交互层** | [`view.js`](file:///Users/huangzhenyu/Projects/layerfs/dsh/packages/view/src/view.js) / [`collector.js`](file:///Users/huangzhenyu/Projects/layerfs/dsh/packages/host/src/collector.js) | 极佳。纯原生 DOM/SVG 渲染，通过轮询 `<traceDir>/<agentId>.jsonl` 与 `inspect.snapshot()` 实时绘制多终端与分支树。 | 仅做单向观测（行车记录仪），无任何并发调度、熔断或死锁干预能力。 |
-| **中间编排层（缺失）** | [`layerfs-dsh-minimalist.patch.yml`](file:///Users/huangzhenyu/Projects/layerfs/dsh/packages/dsh-layerfs/presets/layerfs-dsh-minimalist.patch.yml#L24-L99) | **几乎为零**。没有独立调度器代码，全靠一段 75 行的 System Prompt 让 LLM 在 Bash 中手写 `node <<'JS'` 脚本。 | 1. **16 槽位泄漏死锁**：子 Agent 异常中断即永久占死 Daemon 的 16 个 Workspace 槽位，甚至需要 Prompt 教主 LLM 手写 `for (1..1024)` 循环去人肉卸载（[#L74-L85](file:///Users/huangzhenyu/Projects/layerfs/dsh/packages/dsh-layerfs/presets/layerfs-dsh-minimalist.patch.yml#L74-L85)）；<br>2. **无自动重试**：遇到 `Busy` 或 `HeadMoved` 锁冲突直接报错退出（[#L96](file:///Users/huangzhenyu/Projects/layerfs/dsh/packages/dsh-layerfs/presets/layerfs-dsh-minimalist.patch.yml#L96)）；<br>3. **无抢占与验证门禁**：Node.js `Promise.all` 无法在赛马胜出时毫秒级中断其余分支与子进程。 |
+| **中间编排层（缺失）** | [`layerfs-dsh-minimalist.patch.yml`](../../layerfs/dsh/packages/dsh-layerfs/presets/layerfs-dsh-minimalist.patch.yml#L24-L99) | **几乎为零**。没有独立调度器代码，全靠一段 75 行的 System Prompt 让 LLM 在 Bash 中手写 `node <<'JS'` 脚本。 | 1. **16 槽位泄漏死锁**：子 Agent 异常中断即永久占死 Daemon 的 16 个 Workspace 槽位，需要手工卸载；<br>2. **无自动重试**：遇到 `Busy` 或 `HeadMoved` 锁冲突直接报错退出；<br>3. **无抢占与验证门禁**：Node.js `Promise.all` 无法在赛马胜出时可靠取消其余分支与子进程。 |
 | **存储与沙箱底座** | [`lfs.js`](file:///Users/huangzhenyu/Projects/layerfs/dsh/packages/host/src/lfs.js) / [`sim/binding.js`](file:///Users/huangzhenyu/Projects/layerfs/dsh/packages/host/src/sim/binding.js) / Rust Crates | 极强。提供 `branch.fork`、`sandbox.mount`、`sandbox.commit`、`branch.merge`、`branch.publish` 等原子原语。 | 纯被动存储与执行引擎，不包含任务队列、租约回收或工作流状态机。 |
 
 ---
@@ -36,7 +36,7 @@ flowchart TD
         Blackboard["FactBlackboardActor (跨分支认知共享邮箱)"]
         
         subgraph Topo["确定性拓扑算子 (Typed Topologies)"]
-            Race["Race 算子 (N 分支赛马 + 毫秒级抢占 Kill)"]
+            Race["Race 算子 (N 分支赛马 + 确认卸载后的取消)"]
             MapRed["MapReduce 算子 (模块分治 + 3-Way 自动合流)"]
             Gate["VerifierGate (Opaque Type 编译/单测守门员)"]
         end
@@ -131,7 +131,7 @@ stateDiagram-v2
 ```
 
 * **进程级生死绑定（Process Monitor RAII）**：当 Worker Actor 借出一个挂载点（如 `/workspaces/3`）时，`WorkspacePoolActor` 立即调用 `process.monitor(worker_pid)`。
-* **崩溃零残留**：无论 Worker 是正常跑完、超时熔断、还是在赛马中途被直接 `process.kill` 强杀，`WorkspacePoolActor` 都会在 **1 毫秒内**收到 `ProcessDown` 消息，自动调用 `sandbox.unmount(sb, path, discard: true)` 归还槽位，彻底消灭手动垃圾回收。
+* **崩溃清理**：Worker 的 `ProcessDown` 会触发 `sandbox.unmount(sb, path, discard: true)`；槽位仅在底层确认卸载后归还。超时、错误或 bridge 进程死亡会保留租约并报告未知状态。
 
 ---
 
@@ -144,7 +144,7 @@ stateDiagram-v2
 
 pub type FleetPlan {
   /// 1. 赛马模式：从同一 base_ref 派生 N 个分支并发尝试不同策略，
-  ///    第一个通过 verifier_cmd 的分支立即胜出，其余 N-1 个分支在 1ms 内强行终止并回收 Mount
+  ///    第一个通过 verifier_cmd 的分支胜出，其余 N-1 个分支请求取消并在确认卸载后回收 Mount
   Race(
     base_ref: String,
     candidates: List(CandidateSpec),
@@ -194,7 +194,7 @@ sequenceDiagram
     end
     W1->>LFS: exec 修改代码 + 跑通 npm test (Exit 0!)
     W1->>Coord: 汇报 Winner(VerifiedCommit("race-a", "c8f92a"))
-    Note over Coord,W2: 毫秒级抢占！不再消耗额外 Token 与 CPU
+    Note over Coord,W2: 请求取消；资源在确认卸载后回收
     Coord->>W2: process.kill(W2_Pid)
     W2-->>Pool: Erlang DOWN 信号触发
     Pool->>LFS: sandbox.unmount("/workspaces/2", discard=true)
@@ -220,7 +220,7 @@ sequenceDiagram
 
 | 阶段 | 通信方式 | 实现细节 | 适用场景 |
 | :--- | :--- | :--- | :--- |
-| **Phase 1 (MVP 快速跑通)** | **Erlang Port 长连接守护桥 (`bridge_worker.mjs`)** | Gleam 通过 BEAM 原生 `Port` 启动一个常驻 Node.js 轻量进程，基于 Stdin/Stdout Length-Prefixed JSON 帧直接调用 `@dsh-layerfs/host` 的 `simClient` 或 `@layerfs/sdk`，同时自动追加 `.jsonl` Trace。 | **立即可用（0 Rust 编译成本）**，100% 兼容你本机无 Docker 的 `sim` 模拟器与未来的 Docker Live 模式。 |
+| **Phase 1 (MVP 快速跑通)** | **Erlang Port 长连接守护桥 (`bridge_worker.mjs`)** | Gleam 通过 BEAM 原生 `Port` 启动一个常驻 Node.js 轻量进程，基于 Stdin/Stdout Length-Prefixed JSON 帧直接调用 `@dsh-layerfs/host` 的 `simClient` 或 `@layerfs/sdk`，同时自动追加 `.jsonl` Trace。 | **立即可用（0 Rust 编译成本）**，支持本机无 Docker 的 `sim` 模拟器；Docker Live 模式仍需单独验证。 |
 | **Phase 2 (纯血原生高性能)** | **Rustler NIF / Unix Socket 直连 `layerfs-daemon`** | 直接将 `/Users/huangzhenyu/Projects/layerfs/core/crates/layerfs-api` 与 `layerfs-store-service` 编译为 Erlang Rustler NIF 或通过 Unix Socket 直连 Rust Daemon。 | 生产级高吞吐压测，彻底剥离 Node.js SDK 中转。 |
 
 ### DSH Trace 实时投射规范
@@ -275,7 +275,7 @@ flowchart LR
   我们写一个 50 行的 `FleetSubagentProvider` 注册到 `ctx.subagents.registerProvider(...)`，把 Preset 里的 `provider: spawn` 改成 `provider: fleet`：
   1. **启动前（Pre-hook）**：当主 Agent 调 `subagent` 工具派生子任务时，直接请求 Gleam 的 `WorkspacePoolActor` 自动 `branch.fork("sub-<id>")` 并分配好挂载槽位；
   2. **执行中（In-flight）**：将子 Agent 的环境变量锁死在该专属分支上（如果开启了 `Race` 模式，其中一个子 Agent 跑完，Gleam 直接通过 `AbortController` 秒杀其余子 Agent）；
-  3. **结束后（Post-hook / RAII）**：不管子 Agent 是正常返回、报错还是被用户在网页上点 Stop 中断，Gleam 的 OTP Monitor 100% 兜底执行 `VerifierGate`（跑测试）+ `sandbox.unmount`！
+  3. **结束后（Post-hook / RAII）**：不管子 Agent 是正常返回、报错还是被用户在网页上点 Stop 中断，Gleam 的 OTP Monitor 都会请求 `VerifierGate`（跑测试）+ `sandbox.unmount`；结果未知时保留租约并报告。
 
 ### 缝隙 3：CLI 原地升级——直接扩展 [`lfs.js`](file:///Users/huangzhenyu/Projects/layerfs/dsh/packages/host/src/lfs.js)
 * **源码位置**：[`packages/host/src/env.js`](file:///Users/huangzhenyu/Projects/layerfs/dsh/packages/host/src/env.js#L10-L20) 与 [`packages/host/src/lfs.js`](file:///Users/huangzhenyu/Projects/layerfs/dsh/packages/host/src/lfs.js#L7-L18)
@@ -317,7 +317,7 @@ flowchart LR
 │   │   │   ├── blackboard.gleam      # 跨分支 PubSub 事实与踩坑情报共享黑板
 │   │   │   └── worker_runner.gleam   # 单个分支 Worker Actor (支持 Shell 脚本任务与 Subagent LLM 循环)
 │   │   ├── topologies/
-│   │   │   ├── race.gleam            # 赛马并发控制器 (First-Verified-Wins + 毫秒级抢占 Kill)
+│   │   │   ├── race.gleam            # 赛马并发控制器 (First-Verified-Wins + 确认卸载后的取消)
 │   │   │   ├── map_reduce.gleam      # 分治控制器 + 确定性 3-Way 分支树归约合并器
 │   │   │   └── pipeline.gleam        # 多阶段闯关与失败自动 Layer 回滚状态机
 │   │   ├── bridge/
@@ -326,8 +326,8 @@ flowchart LR
 │   │       ├── http_server.gleam     # Mist HTTP API (供 DSH CLI / MCP 调用)
 │   │       └── cli.gleam             # `fleet` 命令行入口 (替代原版简陋的 lfs.js)
 └── test/
-    ├── workspace_pool_test.gleam     # 验证 Worker 崩溃时 100% 自动 unmount 释放槽位
-    ├── race_preemption_test.gleam    # 验证 1 号跑通单测后 1ms 内强杀 2~5 号并自动 publish
+    ├── workspace_pool_test.gleam     # 验证 Worker 崩溃后的确认卸载与租约保留
+    ├── race_preemption_test.gleam    # 验证 1 号跑通后请求取消其余分支并确认卸载
     └── map_reduce_merge_test.gleam   # 验证多分支并发修改后自动合并与冲突检测
 ```
 
@@ -362,6 +362,6 @@ node "$DSH_LAYERFS_CLI" run feat-1 "node refactor.js" --verify "npm test"
 | 里程碑 | 阶段目标 | 交付物与验收标准 | 预计耗时 |
 | :--- | :--- | :--- | :--- |
 | **M1：底座桥接与 RAII 资源池** | 打通 Gleam (OTP 28) <-> LayerFS (`sim` & `live`) + DSH Web Trace 实时联动 | 1. 完成 `port_driver.gleam` 与 `bridge_worker.mjs`；<br>2. 实现 `workspace_pool.gleam`（槽位上限控制、Busy 自动重试、Worker 崩溃自动 `unmount`）；<br>3. 运行 Gleam 测试时，DSH Web (`:3090`) 的 `Work` 和 `History` 面板实时长出分支图。 | **Day 1（今天即可跑通）** |
-| **M2：Opaque 验证门禁与 `Race` 赛马算子** | 实现 `UnverifiedCommit -> VerifiedCommit` 类型门禁与多分支竞速抢占 | 1. 完成 `layer.gleam` 与 `verifier_gate.gleam`；<br>2. 完成 `race.gleam`：启动 3 个并发分支跑不同耗时任务，验证胜者通过测试后 1ms 内强杀其余分支并自动 `publish` 到 `main`。 | **Day 1 ~ Day 2** |
+| **M2：Opaque 验证门禁与 `Race` 赛马算子** | 实现 `UnverifiedCommit -> VerifiedCommit` 类型门禁与多分支竞速取消 | 1. 完成 `layer.gleam` 与 `verifier_gate.gleam`；<br>2. 完成 `race.gleam`：启动 3 个并发分支跑不同耗时任务，验证胜者通过测试后请求取消其余分支，并在确认卸载后自动 `publish` 到 `main`。 | **Day 1 ~ Day 2** |
 | **M3：`MapReduce` 自动合流与跨分支黑板** | 支持多分支并行修改不同模块后自动 3-Way Tree Merge + 实时情报广播 | 1. 完成 `map_reduce.gleam`（自动两两调用 `branch.merge` 并运行集成测试）；<br>2. 完成 `blackboard.gleam` 跨分支消息总线。 | **Day 2 ~ Day 3** |
 | **M4：DSH 集成与 `FleetSubagentProvider` 挂载** | 将 Gleam 守护进程与 `FleetSubagentProvider` 注入 `@dsh-layerfs/host` | 在 DSH Web 聊天框直接用自然语言让主 Agent 触发多分支赛马/分治，实现端到端闭环。 | **Day 3** |

@@ -2,11 +2,12 @@
 ////
 //// A worker can only produce an `UnverifiedCommit`. The constructor of
 //// `VerifiedCommit` is private to this module and only `verify` calls it, so
-//// `publish` -- whose only input is a `VerifiedCommit` -- cannot be reached
-//// with untested code: a call with an UnverifiedCommit does not compile.
+//// `publish` rejects UnverifiedCommit at compile time. Trusted callers must
+//// obtain the execution evidence through verifier_gate for the exact snapshot.
 
 import aegis/bridge
 import aegis/sdk
+import gleam/result
 
 /// What a worker's command left on its Branch before any test ran.
 pub opaque type UnverifiedCommit {
@@ -83,6 +84,10 @@ pub fn verify(
   result: sdk.Exec,
   duration_ms: Int,
 ) -> Result(VerifiedCommit, VerificationError) {
+  use _ <- result.try(case candidate.commit_id {
+    "" -> Error(CannotVerify("NoChanges: no immutable commit to verify"))
+    _ -> Ok(Nil)
+  })
   case result.exit_code {
     0 ->
       Ok(VerifiedCommit(

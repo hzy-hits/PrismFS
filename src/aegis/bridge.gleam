@@ -58,6 +58,7 @@ pub type Msg {
     args: List(#(String, json.Json)),
     reply: Subject(Result(Dynamic, Error)),
   )
+  AwaitExit(reply: Subject(Result(Nil, Error)))
   FromPort(event: native.PortMessage)
   Ignored
 }
@@ -76,6 +77,7 @@ type State {
     pending: List(Pending),
     next_id: Int,
     closed: Option(String),
+    exit_waiters: List(Subject(Result(Nil, Error))),
   )
 }
 
@@ -127,6 +129,63 @@ pub fn call_json(
   }
 }
 
+/// A lifecycle call retains its reply subject after the ordinary deadline.
+/// `on_timeout` runs once; the caller then owns the eventual definitive reply.
+pub fn call_tracked(
+  bridge: Bridge,
+  op: String,
+  args: List(#(String, json.Json)),
+  timeout: Int,
+  on_timeout: fn(Error) -> Nil,
+) -> Result(Dynamic, Error) {
+  let reply = process.new_subject()
+  process.send(bridge.subject, Request(op, args, reply))
+  case process.receive(reply, timeout) {
+    Ok(answer) -> answer
+    Error(Nil) -> {
+      on_timeout(Timeout(op, timeout))
+      let selector = process.new_selector() |> process.select(reply)
+      process.selector_receive_forever(selector)
+    }
+  }
+}
+
+pub fn call_json_tracked(
+  bridge: Bridge,
+  op: String,
+  args: List(#(String, json.Json)),
+  decoder: decode.Decoder(a),
+  timeout: Int,
+  on_timeout: fn(Error) -> Nil,
+) -> Result(a, Error) {
+  use value <- result.try(call_tracked(bridge, op, args, timeout, on_timeout))
+  case decode.run(value, decoder) {
+    Ok(decoded) -> Ok(decoded)
+    Error(errors) ->
+      Error(BadReply(
+        op <> ": " <> int.to_string(list.length(errors)) <> " decoder error(s)",
+      ))
+  }
+}
+
+/// Stops admission in Node, confirms owned mounts were released, then waits
+/// for the bridge process to exit.
+pub fn shutdown(bridge: Bridge, timeout: Int) -> Result(Nil, Error) {
+  use _ <- result.try(call_json(
+    bridge,
+    "shutdown",
+    [],
+    decode.success(Nil),
+    timeout,
+  ))
+  let reply = process.new_subject()
+  process.send(bridge.subject, AwaitExit(reply))
+  case process.receive(reply, timeout) {
+    Ok(answer) -> answer
+    Error(Nil) -> Error(Timeout("bridge exit", timeout))
+  }
+}
+
 // ---------------------------------------------------------------- server
 
 fn server(config: config.Config, ready: Subject(Result(Subject(Msg), String))) {
@@ -147,7 +206,7 @@ fn server(config: config.Config, ready: Subject(Result(Subject(Msg), String))) {
             Error(Nil) -> Ignored
           }
         })
-      loop(selector, port, State(port, [], 1, None))
+      loop(selector, port, State(port, [], 1, None, []))
     }
   }
 }
@@ -156,14 +215,37 @@ fn loop(selector: process.Selector(Msg), port: Port, state: State) {
   case process.selector_receive_forever(selector) {
     Request(op, args, reply) ->
       loop(selector, port, request(state, op, args, reply))
+    AwaitExit(reply) ->
+      case state.closed {
+        Some(_) -> {
+          process.send(reply, Ok(Nil))
+          loop(selector, port, state)
+        }
+        None ->
+          loop(
+            selector,
+            port,
+            State(..state, exit_waiters: [reply, ..state.exit_waiters]),
+          )
+      }
     FromPort(native.Data(bytes)) ->
       loop(selector, port, receive_frame(state, bytes))
     FromPort(native.Exit(status)) -> {
       let reason =
         "the bridge process exited with status " <> int.to_string(status)
       fail_pending(state.pending, BridgeDown(reason))
+      list.each(state.exit_waiters, fn(reply) {
+        process.send(reply, case status {
+          0 -> Ok(Nil)
+          _ -> Error(BridgeDown(reason))
+        })
+      })
       native.port_close(port)
-      Nil
+      loop(
+        selector,
+        port,
+        State(..state, pending: [], closed: Some(reason), exit_waiters: []),
+      )
     }
     Ignored -> loop(selector, port, state)
   }
@@ -175,25 +257,36 @@ fn request(
   args: List(#(String, json.Json)),
   reply: Subject(Result(Dynamic, Error)),
 ) -> State {
-  let id = state.next_id
-  let frame = encode_request(id, op, args)
-  case native.port_send(state.port, frame) {
-    Error(Nil) -> {
-      process.send(reply, Error(BridgeDown("the bridge process is gone")))
+  case state.closed {
+    Some(reason) -> {
+      process.send(reply, Error(BridgeDown(reason)))
       state
     }
-    Ok(Nil) ->
-      State(
-        ..state,
-        pending: [Pending(id, op, reply), ..state.pending],
-        next_id: id + 1,
-      )
+    None -> {
+      let id = state.next_id
+      let frame = encode_request(id, op, args)
+      case native.port_send(state.port, frame) {
+        Error(Nil) -> {
+          process.send(reply, Error(BridgeDown("the bridge process is gone")))
+          state
+        }
+        Ok(Nil) ->
+          State(
+            ..state,
+            pending: [Pending(id, op, reply), ..state.pending],
+            next_id: id + 1,
+          )
+      }
+    }
   }
 }
 
 fn receive_frame(state: State, bytes: BitArray) -> State {
   case json.parse_bits(bytes, answer_decoder()) {
-    Error(_) -> state
+    Error(_) -> {
+      fail_pending(state.pending, BadReply("invalid JSON frame from bridge"))
+      State(..state, pending: [])
+    }
     Ok(answer) -> settle(state, answer)
   }
 }

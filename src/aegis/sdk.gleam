@@ -101,6 +101,21 @@ pub fn fork(
   )
 }
 
+pub fn fork_snapshot(
+  bridge: bridge.Bridge,
+  snapshot: String,
+  trace: String,
+  timeout: Int,
+) -> Result(Forked, bridge.Error) {
+  bridge.call_json(
+    bridge,
+    "fork_snapshot",
+    [#("snapshot", json.string(snapshot)), #("trace", json.string(trace))],
+    forked_decoder(),
+    timeout,
+  )
+}
+
 pub fn mount(
   bridge: bridge.Bridge,
   branch: String,
@@ -113,6 +128,23 @@ pub fn mount(
     [#("branch", json.string(branch)), #("trace", json.string(trace))],
     mounted_decoder(),
     timeout,
+  )
+}
+
+pub fn mount_tracked(
+  bridge: bridge.Bridge,
+  branch: String,
+  trace: String,
+  timeout: Int,
+  on_timeout: fn(bridge.Error) -> Nil,
+) -> Result(Mounted, bridge.Error) {
+  bridge.call_json_tracked(
+    bridge,
+    "mount",
+    [#("branch", json.string(branch)), #("trace", json.string(trace))],
+    mounted_decoder(),
+    timeout,
+    on_timeout,
   )
 }
 
@@ -168,6 +200,23 @@ pub fn unmount(
     [#("path", json.string(path)), #("discard", json.bool(discard))],
     decode.success(Nil),
     timeout,
+  )
+}
+
+pub fn unmount_tracked(
+  bridge: bridge.Bridge,
+  path: String,
+  discard: Bool,
+  timeout: Int,
+  on_timeout: fn(bridge.Error) -> Nil,
+) -> Result(Nil, bridge.Error) {
+  bridge.call_json_tracked(
+    bridge,
+    "unmount",
+    [#("path", json.string(path)), #("discard", json.bool(discard))],
+    decode.success(Nil),
+    timeout,
+    on_timeout,
   )
 }
 

@@ -1,11 +1,7 @@
-//// The Workspace pool: the one owner of a Sandbox's 16 Workspace slots.
+//// The Workspace pool owns every mount from request through confirmed release.
 ////
-//// A worker checks a Workspace out for a Branch and releases it when done.
-//// The pool monitors the worker process, so a worker that is killed (a Race
-//// loser, a crash, the user pressing Stop) has its Workspace unmounted with
-//// `discard: true` and its slot returned -- no `finally` for anyone to forget.
-//// A `Busy`/`Capacity` mount is retried with exponential backoff while the
-//// slot stays reserved, so the fleet queues instead of failing.
+//// A slot is returned only after the bridge confirms unmount. Dead bridges,
+//// late mount replies, and failed cleanup remain explicit quarantined leases.
 
 import aegis/bridge
 import aegis/config
@@ -17,15 +13,12 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 
-/// One checked-out Workspace. The worker owns it until `release`.
 pub type Leased {
   Leased(id: Int, path: String, branch: String)
 }
 
 pub type PoolError {
-  /// No slot became free within the queue timeout.
   QueueTimeout(worker: String, waited_ms: Int)
-  /// The mount failed for a reason a retry cannot fix.
   MountRefused(error: bridge.Error)
   PoolStopped
 }
@@ -39,7 +32,7 @@ pub fn pool_error_text(error: PoolError) -> String {
       <> int.to_string(waited_ms)
       <> "ms"
     MountRefused(error) -> "mount refused: " <> bridge.error_text(error)
-    PoolStopped -> "the Workspace pool is stopped"
+    PoolStopped -> "the Workspace pool is draining"
   }
 }
 
@@ -55,6 +48,11 @@ pub type Stats {
   )
 }
 
+pub type DrainError {
+  DrainTimeout(outstanding: Stats)
+  PoolUnavailable
+}
+
 pub type Msg {
   Checkout(
     worker: process.Pid,
@@ -63,28 +61,35 @@ pub type Msg {
     trace: String,
     reply: process.Subject(Result(Leased, PoolError)),
   )
-  Mounted(id: Int, path: String)
-  MountFailed(id: Int, error: bridge.Error)
+  Cancel(reply: process.Subject(Result(Leased, PoolError)))
+  MountUnknown(id: Int, error: bridge.Error)
+  MountSettled(id: Int, result: Result(sdk.Mounted, bridge.Error))
   RetryMount(id: Int)
   QueueExpire(id: Int)
   Release(id: Int, discard: Bool)
-  Unmounted(id: Int, result: Result(Nil, bridge.Error))
+  UnmountUnknown(id: Int, error: bridge.Error)
+  UnmountSettled(id: Int, result: Result(Nil, bridge.Error))
+  RetryUnmount(id: Int)
   WorkerDown(id: Int)
   GetStats(reply: process.Subject(Stats))
   Sweep
-  Stop(reply: process.Subject(Nil))
+  Drain(reply: process.Subject(Result(Stats, DrainError)))
 }
 
 type Phase {
   Mounting
+  MountUnknownState(error: bridge.Error)
   Active(path: String)
-  Releasing
+  Releasing(path: String, discard: Bool)
+  ReleaseFailed(path: String, discard: Bool, error: bridge.Error)
+  ReleaseUnknown(path: String, discard: Bool, error: bridge.Error)
 }
 
 type Lease {
   Lease(
     id: Int,
     worker: process.Pid,
+    watcher: process.Pid,
     name: String,
     branch: String,
     trace: String,
@@ -92,9 +97,8 @@ type Lease {
     phase: Phase,
     started: Int,
     retries: Int,
-    /// A release or a worker death while the mount was in flight; the value
-    /// says whether the Workspace must be discarded when it appears.
     released: Option(Bool),
+    reclaim: Bool,
   )
 }
 
@@ -102,6 +106,7 @@ type Waiting {
   Waiting(
     id: Int,
     worker: process.Pid,
+    watcher: process.Pid,
     name: String,
     branch: String,
     trace: String,
@@ -122,10 +127,11 @@ type State {
     unmounted: Int,
     retries: Int,
     reclaimed: Int,
+    draining: Bool,
+    drain_waiters: List(process.Subject(Result(Stats, DrainError))),
   )
 }
 
-/// Starts the pool. It lives under the caller's process tree.
 pub fn start(
   bridge: bridge.Bridge,
   config: config.Config,
@@ -144,6 +150,8 @@ pub fn start(
       unmounted: 0,
       retries: 0,
       reclaimed: 0,
+      draining: False,
+      drain_waiters: [],
     )
   case
     actor.new(state)
@@ -152,15 +160,13 @@ pub fn start(
     |> actor.start
   {
     Ok(_) -> {
-      let delay = int.max(config.lease_ttl_ms / 4, 1000)
-      process.send_after(subject, delay, Sweep) |> ignore
+      schedule_sweep(subject, config)
       Ok(subject)
     }
     Error(_) -> Error(Nil)
   }
 }
 
-/// Waits for a Workspace on `branch`, or refuses after `timeout` ms.
 pub fn checkout(
   pool: process.Subject(Msg),
   branch: String,
@@ -172,11 +178,13 @@ pub fn checkout(
   process.send(pool, Checkout(process.self(), name, branch, trace, reply))
   case process.receive(reply, timeout) {
     Ok(result) -> result
-    Error(Nil) -> Error(QueueTimeout(name, timeout))
+    Error(Nil) -> {
+      process.send(pool, Cancel(reply))
+      Error(QueueTimeout(name, timeout))
+    }
   }
 }
 
-/// Returns a Workspace. `discard` throws uncommitted changes away.
 pub fn release(pool: process.Subject(Msg), id: Int, discard: Bool) {
   process.send(pool, Release(id, discard))
 }
@@ -187,13 +195,11 @@ pub fn stats(pool: process.Subject(Msg), timeout: Int) -> Result(Stats, Nil) {
   process.receive(reply, timeout)
 }
 
-/// Waits until every Workspace is back (used after preempting a Race).
 pub fn await_idle(
   pool: process.Subject(Msg),
   timeout: Int,
 ) -> Result(Stats, Nil) {
-  let deadline = native.monotonic_ms() + timeout
-  await_idle_loop(pool, deadline)
+  await_idle_loop(pool, native.monotonic_ms() + timeout)
 }
 
 fn await_idle_loop(
@@ -202,26 +208,37 @@ fn await_idle_loop(
 ) -> Result(Stats, Nil) {
   case stats(pool, 1000) {
     Error(Nil) -> Error(Nil)
-    Ok(found) ->
-      case found.in_use == 0 {
-        True -> Ok(found)
-        False ->
-          case native.monotonic_ms() >= deadline {
-            True -> Ok(found)
-            False -> {
-              process.sleep(20)
-              await_idle_loop(pool, deadline)
-            }
-          }
+    Ok(found) if found.in_use == 0 -> Ok(found)
+    Ok(_) -> {
+      case native.monotonic_ms() >= deadline {
+        True -> Error(Nil)
+        False -> {
+          process.sleep(20)
+          await_idle_loop(pool, deadline)
+        }
+      }
+    }
+  }
+}
+
+pub fn drain(
+  pool: process.Subject(Msg),
+  timeout: Int,
+) -> Result(Stats, DrainError) {
+  let reply = process.new_subject()
+  process.send(pool, Drain(reply))
+  case process.receive(reply, timeout) {
+    Ok(result) -> result
+    Error(Nil) ->
+      case stats(pool, 1000) {
+        Ok(found) -> Error(DrainTimeout(found))
+        Error(Nil) -> Error(PoolUnavailable)
       }
   }
 }
 
-pub fn stop(pool: process.Subject(Msg)) {
-  let reply = process.new_subject()
-  process.send(pool, Stop(reply))
-  let _ = process.receive(reply, 1000)
-  Nil
+pub fn stop(pool: process.Subject(Msg)) -> Result(Stats, DrainError) {
+  drain(pool, 5000)
 }
 
 // ---------------------------------------------------------------- actor
@@ -229,31 +246,45 @@ pub fn stop(pool: process.Subject(Msg)) {
 fn handle(state: State, message: Msg) -> actor.Next(State, Msg) {
   case message {
     Checkout(worker, name, branch, trace, reply) ->
-      actor.continue(checkout_request(state, worker, name, branch, trace, reply))
-
-    Mounted(id, path) -> actor.continue(mounted(state, id, path))
-
-    MountFailed(id, error) -> actor.continue(mount_failed(state, id, error))
-
-    RetryMount(id) -> actor.continue(retry_mount(state, id))
-
-    QueueExpire(id) -> actor.continue(queue_expire(state, id))
-
-    Release(id, discard) -> actor.continue(release_lease(state, id, discard))
-
-    Unmounted(id, result) -> actor.continue(unmounted(state, id, result))
-
-    WorkerDown(id) -> actor.continue(worker_down(state, id))
-
+      continue_or_stop(checkout_request(
+        state,
+        worker,
+        name,
+        branch,
+        trace,
+        reply,
+      ))
+    Cancel(reply) -> continue_or_stop(cancel(state, reply))
+    MountUnknown(id, error) -> continue_or_stop(mount_unknown(state, id, error))
+    MountSettled(id, result) ->
+      continue_or_stop(mount_settled(state, id, result))
+    RetryMount(id) -> continue_or_stop(retry_mount(state, id))
+    QueueExpire(id) -> continue_or_stop(queue_expire(state, id))
+    Release(id, discard) ->
+      continue_or_stop(release_lease(state, id, discard, False))
+    UnmountUnknown(id, error) ->
+      continue_or_stop(unmount_unknown(state, id, error))
+    UnmountSettled(id, result) ->
+      continue_or_stop(unmount_settled(state, id, result))
+    RetryUnmount(id) -> continue_or_stop(retry_unmount(state, id))
+    WorkerDown(id) -> continue_or_stop(worker_down(state, id))
     GetStats(reply) -> {
       process.send(reply, snapshot(state))
       actor.continue(state)
     }
+    Sweep -> continue_or_stop(sweep(state))
+    Drain(reply) -> continue_or_stop(begin_drain(state, reply))
+  }
+}
 
-    Sweep -> actor.continue(sweep(state))
-
-    Stop(reply) -> {
-      process.send(reply, Nil)
+fn continue_or_stop(state: State) -> actor.Next(State, Msg) {
+  case state.draining && state.active == [] {
+    False -> actor.continue(state)
+    True -> {
+      let found = snapshot(state)
+      list.each(state.drain_waiters, fn(reply) {
+        process.send(reply, Ok(found))
+      })
       actor.stop()
     }
   }
@@ -279,46 +310,73 @@ fn checkout_request(
   trace: String,
   reply: process.Subject(Result(Leased, PoolError)),
 ) -> State {
-  let id = state.next_id
-  start_watcher(state.self, id, worker)
-  case list.length(state.active) < state.config.max_slots {
+  case state.draining {
     True -> {
-      let lease = new_lease(id, worker, name, branch, trace, reply, 0)
-      start_mount(state, lease)
-      State(..state, next_id: id + 1, active: [lease, ..state.active])
+      process.send(reply, Error(PoolStopped))
+      state
     }
     False -> {
-      let waiting =
-        Waiting(
-          id: id,
-          worker: worker,
-          name: name,
-          branch: branch,
-          trace: trace,
-          reply: reply,
-          since: native.monotonic_ms(),
-        )
-      process.send_after(
-        state.self,
-        state.config.queue_timeout,
-        QueueExpire(id),
-      )
-      |> ignore
-      State(
-        ..state,
-        next_id: id + 1,
-        queue: list.append(state.queue, [waiting]),
-      )
+      let id = state.next_id
+      let watcher = start_watcher(state.self, process.self(), id, worker)
+      case list.length(state.active) < state.config.max_slots {
+        True -> {
+          let lease =
+            new_lease(id, worker, watcher, name, branch, trace, reply, 0)
+          start_mount(state, lease)
+          State(..state, next_id: id + 1, active: [lease, ..state.active])
+        }
+        False -> {
+          let waiting =
+            Waiting(
+              id: id,
+              worker: worker,
+              watcher: watcher,
+              name: name,
+              branch: branch,
+              trace: trace,
+              reply: reply,
+              since: native.monotonic_ms(),
+            )
+          process.send_after(
+            state.self,
+            state.config.queue_timeout,
+            QueueExpire(id),
+          )
+          |> ignore
+          State(
+            ..state,
+            next_id: id + 1,
+            queue: list.append(state.queue, [waiting]),
+          )
+        }
+      }
     }
   }
 }
 
-/// A waiter's own timer: the pool refuses it even if no slot ever frees.
-/// A late timer for an already-granted id finds no waiter and does nothing.
+fn cancel(
+  state: State,
+  reply: process.Subject(Result(Leased, PoolError)),
+) -> State {
+  let #(queued, rest) = list.partition(state.queue, fn(w) { w.reply == reply })
+  case queued {
+    [waiter, ..] -> {
+      process.kill(waiter.watcher)
+      State(..state, queue: rest)
+    }
+    [] ->
+      case list.find(state.active, fn(lease) { lease.reply == reply }) {
+        Error(Nil) -> state
+        Ok(lease) -> release_lease(state, lease.id, True, True)
+      }
+  }
+}
+
 fn queue_expire(state: State, id: Int) -> State {
   let #(expired, rest) = list.partition(state.queue, fn(w) { w.id == id })
   case expired {
     [waiter, ..] -> {
+      process.kill(waiter.watcher)
       process.send(
         waiter.reply,
         Error(QueueTimeout(waiter.name, native.monotonic_ms() - waiter.since)),
@@ -329,29 +387,30 @@ fn queue_expire(state: State, id: Int) -> State {
   }
 }
 
-/// Watches one worker from a process of its own: actors receive only their own
-/// message type, so a monitor's raw DOWN tuple is turned into `WorkerDown`.
-fn start_watcher(pool: process.Subject(Msg), id: Int, worker: process.Pid) {
-  let _ =
-    process.spawn_unlinked(fn() {
-      let monitor = process.monitor(worker)
-      case process.is_alive(worker) {
-        False -> process.send(pool, WorkerDown(id))
-        True -> {
-          let selector =
-            process.new_selector()
-            |> process.select_specific_monitor(monitor, fn(down) { down })
-          let _ = process.selector_receive_forever(selector)
-          process.send(pool, WorkerDown(id))
-        }
-      }
-    })
-  Nil
+fn start_watcher(
+  pool: process.Subject(Msg),
+  pool_pid: process.Pid,
+  id: Int,
+  worker: process.Pid,
+) -> process.Pid {
+  process.spawn_unlinked(fn() {
+    let worker_monitor = process.monitor(worker)
+    let pool_monitor = process.monitor(pool_pid)
+    let selector =
+      process.new_selector()
+      |> process.select_specific_monitor(worker_monitor, fn(_) { True })
+      |> process.select_specific_monitor(pool_monitor, fn(_) { False })
+    case process.selector_receive_forever(selector) {
+      True -> process.send(pool, WorkerDown(id))
+      False -> Nil
+    }
+  })
 }
 
 fn new_lease(
   id: Int,
   worker: process.Pid,
+  watcher: process.Pid,
   name: String,
   branch: String,
   trace: String,
@@ -361,6 +420,7 @@ fn new_lease(
   Lease(
     id: id,
     worker: worker,
+    watcher: watcher,
     name: name,
     branch: branch,
     trace: trace,
@@ -369,6 +429,7 @@ fn new_lease(
     started: native.monotonic_ms(),
     retries: retries,
     released: None,
+    reclaim: False,
   )
 }
 
@@ -378,95 +439,161 @@ fn start_mount(state: State, lease: Lease) {
   let timeout = state.config.call_timeout
   let _ =
     process.spawn_unlinked(fn() {
-      let result = sdk.mount(b, lease.branch, lease.trace, timeout)
-      process.send(pool, case result {
-        Ok(mounted) -> Mounted(lease.id, mounted.path)
-        Error(error) -> MountFailed(lease.id, error)
-      })
+      let result =
+        sdk.mount_tracked(b, lease.branch, lease.trace, timeout, fn(error) {
+          process.send(pool, MountUnknown(lease.id, error))
+        })
+      process.send(pool, MountSettled(lease.id, result))
     })
   Nil
 }
 
-fn mounted(state: State, id: Int, path: String) -> State {
+fn mount_unknown(state: State, id: Int, error: bridge.Error) -> State {
   case find_lease(state.active, id) {
     Error(Nil) -> state
     Ok(lease) ->
       case lease.released {
-        Some(discard) -> {
-          start_unmount(state, id, path, discard)
-          update_lease(state, id, fn(l) { Lease(..l, phase: Releasing) })
-        }
+        Some(_) ->
+          update_lease(state, id, fn(found) {
+            Lease(..found, phase: MountUnknownState(error))
+          })
         None -> {
-          process.send(lease.reply, Ok(Leased(id, path, lease.branch)))
-          State(
-            ..update_lease(state, id, fn(l) { Lease(..l, phase: Active(path)) }),
-            granted: state.granted + 1,
-          )
+          process.send(lease.reply, Error(MountRefused(error)))
+          update_lease(state, id, fn(found) {
+            Lease(
+              ..found,
+              phase: MountUnknownState(error),
+              released: Some(True),
+              reclaim: True,
+            )
+          })
         }
       }
   }
 }
 
-fn mount_failed(state: State, id: Int, error: bridge.Error) -> State {
+fn mount_settled(
+  state: State,
+  id: Int,
+  result: Result(sdk.Mounted, bridge.Error),
+) -> State {
   case find_lease(state.active, id) {
     Error(Nil) -> state
     Ok(lease) ->
-      case lease.released {
-        Some(_) -> drop_lease(state, id)
-        None ->
-          case
-            bridge.retryable(error)
-            && lease.retries < state.config.max_mount_retries
-          {
-            True -> {
-              let delay = backoff(state.config.mount_backoff_ms, lease.retries)
-              process.send_after(state.self, delay, RetryMount(id)) |> ignore
+      case result {
+        Ok(mounted) ->
+          case lease.released {
+            Some(discard) -> begin_unmount(state, lease, mounted.path, discard)
+            None -> {
+              process.send(
+                lease.reply,
+                Ok(Leased(id, mounted.path, lease.branch)),
+              )
               State(
-                ..update_lease(state, id, fn(l) {
-                  Lease(..l, retries: l.retries + 1)
+                ..update_lease(state, id, fn(found) {
+                  Lease(..found, phase: Active(mounted.path))
                 }),
-                retries: state.retries + 1,
+                granted: state.granted + 1,
               )
             }
-            False -> {
-              process.send(lease.reply, Error(MountRefused(error)))
-              drop_lease(state, id)
-            }
           }
+        Error(error) ->
+          case error {
+            bridge.Refused(_, _) ->
+              definitive_mount_failure(state, lease, error)
+            _ -> mount_unknown(state, id, error)
+          }
+      }
+  }
+}
+
+fn definitive_mount_failure(
+  state: State,
+  lease: Lease,
+  error: bridge.Error,
+) -> State {
+  case lease.released {
+    Some(_) -> drop_lease(state, lease.id)
+    None ->
+      case
+        bridge.retryable(error)
+        && lease.retries < state.config.max_mount_retries
+      {
+        True -> {
+          let delay = backoff(state.config.mount_backoff_ms, lease.retries)
+          process.send_after(state.self, delay, RetryMount(lease.id)) |> ignore
+          State(
+            ..update_lease(state, lease.id, fn(found) {
+              Lease(..found, phase: Mounting, retries: found.retries + 1)
+            }),
+            retries: state.retries + 1,
+          )
+        }
+        False -> {
+          process.send(lease.reply, Error(MountRefused(error)))
+          drop_lease(state, lease.id)
+        }
       }
   }
 }
 
 fn retry_mount(state: State, id: Int) -> State {
   case find_lease(state.active, id) {
-    Error(Nil) -> state
+    Ok(Lease(phase: Mounting, released: None, ..) as lease) -> {
+      start_mount(state, lease)
+      state
+    }
     Ok(lease) ->
       case lease.released {
         Some(_) -> drop_lease(state, id)
-        None -> {
-          start_mount(state, lease)
-          state
-        }
+        None -> state
       }
+    Error(Nil) -> state
   }
 }
 
-fn release_lease(state: State, id: Int, discard: Bool) -> State {
+fn release_lease(state: State, id: Int, discard: Bool, reclaim: Bool) -> State {
   case find_lease(state.active, id) {
     Error(Nil) -> state
-    Ok(lease) ->
-      case lease.phase {
-        Active(path) -> {
-          start_unmount(state, id, path, discard)
-          update_lease(state, id, fn(l) {
-            Lease(..l, phase: Releasing, released: Some(discard))
-          })
-        }
-        Mounting ->
-          update_lease(state, id, fn(l) { Lease(..l, released: Some(discard)) })
-        Releasing -> state
+    Ok(lease) -> {
+      let discard = case lease.released {
+        Some(previous) -> previous || discard
+        None -> discard
       }
+      let state =
+        update_lease(state, id, fn(found) {
+          Lease(
+            ..found,
+            released: Some(discard),
+            reclaim: found.reclaim || reclaim,
+          )
+        })
+      case lease.phase {
+        Active(path) -> begin_unmount(state, lease, path, discard)
+        Mounting -> state
+        MountUnknownState(_) -> state
+        Releasing(_, _) -> state
+        ReleaseUnknown(_, _, _) -> state
+        ReleaseFailed(_, _, _) -> state
+      }
+    }
   }
+}
+
+fn begin_unmount(
+  state: State,
+  lease: Lease,
+  path: String,
+  discard: Bool,
+) -> State {
+  let lease = case find_lease(state.active, lease.id) {
+    Ok(found) -> found
+    Error(Nil) -> lease
+  }
+  start_unmount(state, lease.id, path, discard)
+  update_lease(state, lease.id, fn(found) {
+    Lease(..found, phase: Releasing(path, discard), released: Some(discard))
+  })
 }
 
 fn start_unmount(state: State, id: Int, path: String, discard: Bool) {
@@ -475,104 +602,168 @@ fn start_unmount(state: State, id: Int, path: String, discard: Bool) {
   let timeout = state.config.call_timeout
   let _ =
     process.spawn_unlinked(fn() {
-      let result = sdk.unmount(b, path, discard, timeout)
-      process.send(pool, Unmounted(id, result))
+      let result =
+        sdk.unmount_tracked(b, path, discard, timeout, fn(error) {
+          process.send(pool, UnmountUnknown(id, error))
+        })
+      process.send(pool, UnmountSettled(id, result))
     })
   Nil
 }
 
-fn unmounted(
+fn unmount_unknown(state: State, id: Int, error: bridge.Error) -> State {
+  case find_lease(state.active, id) {
+    Ok(Lease(phase: Releasing(path, discard), ..)) ->
+      update_lease(state, id, fn(found) {
+        Lease(..found, phase: ReleaseUnknown(path, discard, error))
+      })
+    _ -> state
+  }
+}
+
+fn unmount_settled(
   state: State,
   id: Int,
   result: Result(Nil, bridge.Error),
 ) -> State {
-  let state = drop_lease(state, id)
-  case result {
-    Ok(Nil) -> State(..state, unmounted: state.unmounted + 1)
-    Error(_error) ->
-      // Unreachable in a healthy daemon; the slot is still returned so one
-      // bad Workspace cannot wedge the whole fleet.
-      State(..state, reclaimed: state.reclaimed + 1)
+  case find_lease(state.active, id) {
+    Error(Nil) -> state
+    Ok(lease) ->
+      case result {
+        Ok(Nil) -> {
+          let released = drop_lease(state, id)
+          State(
+            ..released,
+            unmounted: state.unmounted + 1,
+            reclaimed: state.reclaimed
+              + case lease.reclaim {
+                True -> 1
+                False -> 0
+              },
+          )
+        }
+        Error(error) ->
+          case phase_path(lease.phase) {
+            Error(Nil) -> state
+            Ok(#(path, discard)) ->
+              case error {
+                bridge.Refused(_, _) ->
+                  schedule_release_retry(state, lease, path, discard, error)
+                _ ->
+                  update_lease(state, id, fn(found) {
+                    Lease(..found, phase: ReleaseUnknown(path, discard, error))
+                  })
+              }
+          }
+      }
+  }
+}
+
+fn schedule_release_retry(
+  state: State,
+  lease: Lease,
+  path: String,
+  discard: Bool,
+  error: bridge.Error,
+) -> State {
+  let delay = backoff(state.config.mount_backoff_ms, lease.retries)
+  process.send_after(state.self, delay, RetryUnmount(lease.id)) |> ignore
+  State(
+    ..update_lease(state, lease.id, fn(found) {
+      Lease(
+        ..found,
+        phase: ReleaseFailed(path, discard, error),
+        retries: found.retries + 1,
+      )
+    }),
+    retries: state.retries + 1,
+  )
+}
+
+fn retry_unmount(state: State, id: Int) -> State {
+  case find_lease(state.active, id) {
+    Ok(Lease(phase: ReleaseFailed(path, discard, _), ..) as lease) ->
+      begin_unmount(state, lease, path, discard)
+    _ -> state
+  }
+}
+
+fn phase_path(phase: Phase) -> Result(#(String, Bool), Nil) {
+  case phase {
+    Releasing(path, discard) -> Ok(#(path, discard))
+    ReleaseFailed(path, discard, _) -> Ok(#(path, discard))
+    ReleaseUnknown(path, discard, _) -> Ok(#(path, discard))
+    _ -> Error(Nil)
   }
 }
 
 fn worker_down(state: State, id: Int) -> State {
-  // 1. a waiter that never got a slot: just forget it
   let #(dead, queued) = list.partition(state.queue, fn(w) { w.id == id })
   case dead {
     [_] -> State(..state, queue: queued)
-    _ -> worker_down_lease(state, id)
+    _ -> release_lease(state, id, True, True)
   }
-}
-
-fn worker_down_lease(state: State, id: Int) -> State {
-  // 2. a lease held by the dead worker: discard it
-  case find_lease(state.active, id) {
-    Error(Nil) -> state
-    Ok(lease) ->
-      case lease.phase, lease.released {
-        Releasing, _ -> state
-        _, Some(_) -> state
-        _, None -> {
-          let state =
-            update_lease(state, id, fn(l) { Lease(..l, released: Some(True)) })
-          let state = reclaim_count(state, 1)
-          case lease.phase {
-            Active(path) -> {
-              start_unmount(state, id, path, True)
-              update_lease(state, id, fn(l) { Lease(..l, phase: Releasing) })
-            }
-            Mounting -> state
-            Releasing -> state
-          }
-        }
-      }
-  }
-}
-
-fn reclaim_count(state: State, count: Int) -> State {
-  State(..state, reclaimed: state.reclaimed + count)
 }
 
 fn sweep(state: State) -> State {
   let now = native.monotonic_ms()
-  // Reclaim leases whose worker is gone or whose TTL passed.
   let state =
-    list.fold(state.active, state, fn(state, lease) {
+    list.fold(state.active, state, fn(current, lease) {
       case lease.phase {
-        Active(path) ->
-          case now - lease.started > state.config.lease_ttl_ms {
-            True -> {
-              start_unmount(state, lease.id, path, True)
-              update_lease(state, lease.id, fn(l) {
-                Lease(..l, phase: Releasing, released: Some(True))
-              })
-            }
-            False -> state
-          }
-        _ -> state
+        Active(_) if now - lease.started > state.config.lease_ttl_ms ->
+          release_lease(current, lease.id, True, True)
+        _ -> current
       }
     })
-
-  let delay = int.max(state.config.lease_ttl_ms / 4, 1000)
-  process.send_after(state.self, delay, Sweep) |> ignore
+  case state.draining {
+    True -> Nil
+    False -> schedule_sweep(state.self, state.config)
+  }
   pump(state)
 }
 
+fn begin_drain(
+  state: State,
+  reply: process.Subject(Result(Stats, DrainError)),
+) -> State {
+  let queue = state.queue
+  list.each(queue, fn(waiter) {
+    process.kill(waiter.watcher)
+    process.send(waiter.reply, Error(PoolStopped))
+  })
+  let state =
+    State(..state, draining: True, queue: [], drain_waiters: [
+      reply,
+      ..state.drain_waiters
+    ])
+  list.fold(state.active, state, fn(current, lease) {
+    case lease.phase {
+      Mounting -> process.send(lease.reply, Error(PoolStopped))
+      _ -> Nil
+    }
+    release_lease(current, lease.id, True, True)
+  })
+}
+
 fn pump(state: State) -> State {
-  case state.queue {
-    [] -> state
-    [next, ..rest] ->
+  case state.draining, state.queue {
+    True, _ -> state
+    False, [] -> state
+    False, [next, ..rest] ->
       case list.length(state.active) < state.config.max_slots {
         False -> state
         True -> {
           let state = State(..state, queue: rest)
           case process.is_alive(next.worker) {
-            False -> pump(state)
+            False -> {
+              process.kill(next.watcher)
+              pump(state)
+            }
             True -> {
               let waited = native.monotonic_ms() - next.since
               case waited > state.config.queue_timeout {
                 True -> {
+                  process.kill(next.watcher)
                   process.send(
                     next.reply,
                     Error(QueueTimeout(next.name, waited)),
@@ -584,6 +775,7 @@ fn pump(state: State) -> State {
                     new_lease(
                       next.id,
                       next.worker,
+                      next.watcher,
                       next.name,
                       next.branch,
                       next.trace,
@@ -602,29 +794,38 @@ fn pump(state: State) -> State {
 }
 
 fn drop_lease(state: State, id: Int) -> State {
-  let #(_, kept) = list.partition(state.active, fn(l) { l.id == id })
+  case find_lease(state.active, id) {
+    Ok(lease) -> process.kill(lease.watcher)
+    Error(Nil) -> Nil
+  }
+  let #(_, kept) = list.partition(state.active, fn(lease) { lease.id == id })
   pump(State(..state, active: kept))
 }
 
 fn update_lease(state: State, id: Int, change: fn(Lease) -> Lease) -> State {
   State(
     ..state,
-    active: list.map(state.active, fn(l) {
-      case l.id == id {
-        True -> change(l)
-        False -> l
+    active: list.map(state.active, fn(lease) {
+      case lease.id == id {
+        True -> change(lease)
+        False -> lease
       }
     }),
   )
 }
 
 fn find_lease(active: List(Lease), id: Int) -> Result(Lease, Nil) {
-  list.find(active, fn(l) { l.id == id })
+  list.find(active, fn(lease) { lease.id == id })
+}
+
+fn schedule_sweep(subject: process.Subject(Msg), config: config.Config) {
+  process.send_after(subject, int.max(config.lease_ttl_ms / 4, 1000), Sweep)
+  |> ignore
 }
 
 fn backoff(base: Int, attempt: Int) -> Int {
   case attempt <= 0 {
-    True -> base
+    True -> int.max(base, 1)
     False -> int.min(backoff(base, attempt - 1) * 2, 5000)
   }
 }

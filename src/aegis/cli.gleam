@@ -1089,8 +1089,33 @@ fn with_fleet(
     |> result.map_error(fn(_) { "the Workspace pool did not start" }),
   )
   let outcome = body(b, pool)
-  workspace_pool.stop(pool)
-  outcome
+  let drained =
+    workspace_pool.drain(pool, cfg.call_timeout)
+    |> result.map_error(fn(error) {
+      case error {
+        workspace_pool.DrainTimeout(stats) ->
+          "Workspace drain timed out with "
+          <> int.to_string(stats.in_use)
+          <> " owned slot(s), "
+          <> int.to_string(stats.queued)
+          <> " queued"
+        workspace_pool.PoolUnavailable ->
+          "Workspace drain failed: pool unavailable"
+      }
+    })
+  let stopped = case drained {
+    Error(reason) -> Error(reason)
+    Ok(_) ->
+      bridge.shutdown(b, cfg.call_timeout)
+      |> result.map_error(fn(error) {
+        "bridge shutdown failed: " <> bridge.error_text(error)
+      })
+  }
+  case outcome, stopped {
+    Error(reason), _ -> Error(reason)
+    Ok(_), Error(reason) -> Error(reason)
+    Ok(value), Ok(Nil) -> Ok(value)
+  }
 }
 
 fn report_pool(pool: process.Subject(workspace_pool.Msg), cfg: config.Config) {

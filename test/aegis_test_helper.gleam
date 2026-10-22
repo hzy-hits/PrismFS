@@ -77,7 +77,8 @@ fn fail(prefix: String, detail: String) {
 }
 
 pub fn stop(fleet: Fleet) {
-  workspace_pool.stop(fleet.pool)
+  let assert Ok(_) = workspace_pool.stop(fleet.pool)
+  let assert Ok(Nil) = bridge.shutdown(fleet.bridge, fleet.config.call_timeout)
 }
 
 /// Polls `check` every 10ms until it holds or `timeout` ms pass.
