@@ -52,7 +52,14 @@ export class LayerFS {
         return "/controlled/workspace";
       },
       exec: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
-      commit: async () => ({ kind: "Committed", head: "commit", commit: { id: "commit" } }),
+      commit: async () => {
+        record("commit-start");
+        if (this.projectName.includes("late-commit")) {
+          await waitForGate("allow-commit");
+        }
+        record("commit-success");
+        return { kind: "Committed", head: "commit", commit: { id: "commit" } };
+      },
       unmount: async (sandbox, path, discard) => {
         unmountAttempts++;
         record("unmount", { sandbox, path, discard, attempt: unmountAttempts });

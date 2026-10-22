@@ -13,6 +13,7 @@ import aegis/domain/layer
 import aegis/domain/plan
 import aegis/native
 import aegis/sdk
+import aegis/tool_step
 import aegis/topologies/map_reduce
 import aegis/topologies/pipeline
 import aegis/topologies/portfolio
@@ -47,6 +48,8 @@ pub fn usage() -> String {
   <> "                                        the main agent's decision: re-verify, publish\n"
   <> "  fleet run <branch> \"<command>\" [--verify \"<cmd>\"]\n"
   <> "                                        one leased Workspace, one Commit\n"
+  <> "  fleet step <branch> <base> \"<command>\"\n"
+  <> "                                        DSH tool step, JSON after confirmed cleanup\n"
   <> "  fleet demo <fixture-folder>           Race + explicit decision, fresh project\n"
   <> "  fleet demo-map-reduce <fixture>       MapReduce + explicit decision\n"
   <> "  fleet decisions                       decision packets and publish receipts\n"
@@ -68,6 +71,7 @@ pub fn run(command: String, args: List(String)) -> Result(Nil, String) {
     "pipeline" -> command_pipeline(args)
     "publish" -> command_publish(args)
     "run" -> command_run(args)
+    "step" -> command_step(args)
     "demo" -> command_demo(args)
     "demo-map-reduce" -> command_demo_map_reduce(args)
     "decisions" -> command_decisions(args)
@@ -338,6 +342,24 @@ fn publish_branch(
 }
 
 // ---------------------------------------------------------------- one branch
+
+fn command_step(args: List(String)) -> Result(Nil, String) {
+  use cfg <- result.try(load_config())
+  case args {
+    [branch, base, command] -> {
+      // The tool owns the lease until execution and commit have settled.
+      let cfg = config.Config(..cfg, lease_ttl_ms: 0)
+      use output <- result.try(
+        with_fleet(cfg, fn(b, pool) {
+          tool_step.run(b, pool, cfg, branch, base, command)
+        }),
+      )
+      io.println(json.to_string(output))
+      Ok(Nil)
+    }
+    _ -> Error("usage: fleet step <branch> <base> \"<command>\"")
+  }
+}
 
 fn command_run(args: List(String)) -> Result(Nil, String) {
   use cfg <- result.try(load_config())

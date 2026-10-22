@@ -1,0 +1,32 @@
+# Add this preset to an existing DSH profile that already loads layerfs-host,
+# shellEnv, and the native spawn provider. Replace both absolute paths.
+- id: preset-prismfs
+  name: '@deepseek-ai/dsh-agent-preset'
+  config:
+    id: prismfs
+    name: PrismFS
+    description: Native DSH agents with session-bound LayerFS branches.
+    plugins:
+      - id: persona
+        name: '@deepseek-ai/dsh-persona'
+        config:
+          prefix: |-
+            Work on the project through bash. Your session has its own Branch.
+            Delegate work through subagent; children inherit this preset and have
+            their own Branches. Report the Branch and Commit from your final bash
+            result to the parent. A child does not publish. Reading commands also
+            return the current Commit. Publication is an explicit operator action
+            outside this preset. Do not call the LayerFS SDK yourself.
+      - id: prismfs-bash
+        name: 'file:///ABSOLUTE/PATH/PrismFS/integration/dsh-plugin.mjs'
+        config:
+          binary: /ABSOLUTE/PATH/PrismFS/aegisfleet
+      - id: tool-subagent
+        name: '@deepseek-ai/dsh-tool-subagent'
+        config:
+          provider: spawn
+          toolName: subagent
+      - id: tool-subagent-control
+        name: '@deepseek-ai/dsh-tool-subagent-control'
+      - id: tool-subagent-list-agents
+        name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'

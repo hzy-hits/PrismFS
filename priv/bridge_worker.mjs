@@ -252,6 +252,14 @@ const ops = {
     return { kind: r.kind, head: r.head ?? null, commitId: r.commit?.id ?? r.head ?? null };
   },
 
+  async step_exec({ path, command, trace, timeoutMs }) {
+    if (typeof command !== "string" || !command.trim() || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      throw fail("InvalidInput", "step needs a command and positive timeoutMs");
+    }
+    const quoted = "'" + command.replaceAll("'", "'\\''") + "'";
+    return ops.exec({ path, trace, command: `timeout --kill-after=5s ${timeoutMs / 1000}s bash -c ${quoted}` });
+  },
+
   async unmount({ path, discard }) {
     fireFault("unmount");
     if (!path) throw fail("InvalidInput", "unmount needs path");
