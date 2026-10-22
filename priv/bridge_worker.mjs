@@ -385,6 +385,27 @@ async function releaseMounts() {
   return failures;
 }
 
+let cleanupPromise = null;
+let closePromise = null;
+
+function cleanupMounts() {
+  if (!cleanupPromise) {
+    cleanupPromise = releaseMounts().finally(() => {
+      cleanupPromise = null;
+    });
+  }
+  return cleanupPromise;
+}
+
+function closeLayer() {
+  if (!closePromise) {
+    closePromise = Promise.resolve()
+      .then(() => lf?.close?.())
+      .catch(() => undefined);
+  }
+  return closePromise;
+}
+
 let closing = false;
 let accepting = true;
 let activeOperations = 0;
@@ -415,11 +436,11 @@ function unresolvedText(failures) {
 async function explicitShutdown() {
   accepting = false;
   await waitForOperations();
-  const failures = await releaseMounts();
+  const failures = await cleanupMounts();
   if (failures.length) {
     throw fail("CleanupFailed", `owned mounts remain: ${unresolvedText(failures)}`);
   }
-  try { await lf?.close?.(); } catch { /* already closed */ }
+  await closeLayer();
   setImmediate(() => process.exit(0));
   return { ok: true };
 }
@@ -431,13 +452,13 @@ async function terminalShutdown(code, reason) {
   await waitForOperations();
   let delay = 50;
   for (;;) {
-    const failures = await releaseMounts();
+    const failures = await cleanupMounts();
     if (!failures.length) break;
     log(`${reason} cleanup unresolved: ${unresolvedText(failures)}`);
     await new Promise((resolve) => setTimeout(resolve, delay));
     delay = Math.min(delay * 2, 5000);
   }
-  try { await lf?.close?.(); } catch { /* already closed */ }
+  await closeLayer();
   process.exit(code);
 }
 

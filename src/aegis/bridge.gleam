@@ -76,7 +76,7 @@ type State {
     port: Port,
     pending: List(Pending),
     next_id: Int,
-    closed: Option(String),
+    closed: Option(Result(Nil, Error)),
     exit_waiters: List(Subject(Result(Nil, Error))),
   )
 }
@@ -178,6 +178,10 @@ pub fn shutdown(bridge: Bridge, timeout: Int) -> Result(Nil, Error) {
     decode.success(Nil),
     timeout,
   ))
+  await_exit(bridge, timeout)
+}
+
+pub fn await_exit(bridge: Bridge, timeout: Int) -> Result(Nil, Error) {
   let reply = process.new_subject()
   process.send(bridge.subject, AwaitExit(reply))
   case process.receive(reply, timeout) {
@@ -217,8 +221,8 @@ fn loop(selector: process.Selector(Msg), port: Port, state: State) {
       loop(selector, port, request(state, op, args, reply))
     AwaitExit(reply) ->
       case state.closed {
-        Some(_) -> {
-          process.send(reply, Ok(Nil))
+        Some(result) -> {
+          process.send(reply, result)
           loop(selector, port, state)
         }
         None ->
@@ -233,18 +237,17 @@ fn loop(selector: process.Selector(Msg), port: Port, state: State) {
     FromPort(native.Exit(status)) -> {
       let reason =
         "the bridge process exited with status " <> int.to_string(status)
+      let result = case status {
+        0 -> Ok(Nil)
+        _ -> Error(BridgeDown(reason))
+      }
       fail_pending(state.pending, BridgeDown(reason))
-      list.each(state.exit_waiters, fn(reply) {
-        process.send(reply, case status {
-          0 -> Ok(Nil)
-          _ -> Error(BridgeDown(reason))
-        })
-      })
+      list.each(state.exit_waiters, fn(reply) { process.send(reply, result) })
       native.port_close(port)
       loop(
         selector,
         port,
-        State(..state, pending: [], closed: Some(reason), exit_waiters: []),
+        State(..state, pending: [], closed: Some(result), exit_waiters: []),
       )
     }
     Ignored -> loop(selector, port, state)
@@ -258,8 +261,12 @@ fn request(
   reply: Subject(Result(Dynamic, Error)),
 ) -> State {
   case state.closed {
-    Some(reason) -> {
-      process.send(reply, Error(BridgeDown(reason)))
+    Some(exit_result) -> {
+      let error = case exit_result {
+        Ok(Nil) -> BridgeDown("the bridge process exited with status 0")
+        Error(found) -> found
+      }
+      process.send(reply, Error(error))
       state
     }
     None -> {

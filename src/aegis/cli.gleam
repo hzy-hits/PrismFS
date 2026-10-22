@@ -1112,7 +1112,9 @@ fn with_fleet(
       })
   }
   case outcome, stopped {
-    Error(reason), _ -> Error(reason)
+    Error(reason), Ok(_) -> Error(reason)
+    Error(reason), Error(cleanup_reason) ->
+      Error(reason <> "; cleanup failed: " <> cleanup_reason)
     Ok(_), Error(reason) -> Error(reason)
     Ok(value), Ok(Nil) -> Ok(value)
   }

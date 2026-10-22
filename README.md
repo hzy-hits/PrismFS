@@ -8,9 +8,9 @@
 
 It replaces fragile, prompt-driven shell orchestration (`mount → exec → commit → unmount` loops and manual workspace garbage collection) with a strongly-typed OTP supervision and scheduling kernel:
 - **Process-bound Workspace Leases**: A crashed, timed-out, or preempted worker triggers cleanup; the slot stays owned until `unmount` is confirmed.
-- **Snapshot Verification Gate**: Opaque types prevent callers from passing an `UnverifiedCommit` to `layer.publish`; the gate runs against the exact immutable Commit ID and publish still relies on LayerFS CAS.
-- **Deterministic Fleet Topologies**: First-class `Race` (latency hedging with cooperative cancellation), `MapReduce` (parallel sharded execution with automated 3-way merge), and `Portfolio` (exhaustive multi-strategy evaluation).
-- **Main-Agent Sovereignty**: Topologies never mutate `main` behind the caller's back. They emit structured decision packets so the root agent (or human operator) retains final authority via CAS-guarded `publish`.
+- **Snapshot Verification Gate**: Opaque types prevent callers from passing an `UnverifiedCommit` to `layer.publish`; the gate runs against the exact immutable Commit ID and publish checks the candidate/source head with LayerFS CAS. The expected-`main` concurrent-overwrite policy is unchanged.
+- **Deterministic Fleet Topologies**: First-class `Race` (latency hedging with BEAM worker termination and confirmed cleanup), `MapReduce` (parallel sharded execution with automated 3-way merge), and `Portfolio` (exhaustive multi-strategy evaluation). Worker termination does not guarantee cancellation of OS- or remote-owned requests.
+- **Main-Agent Sovereignty**: Topologies never mutate `main` behind the caller's back. They emit structured decision packets so the root agent (or human operator) retains final authority via explicit `publish`.
 
 ---
 
@@ -80,20 +80,21 @@ flowchart LR
 ### 3. Compile-Time Verification Gate (`aegis/domain/layer`)
 - Worker execution produces only an opaque `UnverifiedCommit`.
 - The constructor for `VerifiedCommit` is private to `aegis/domain/layer`. `VerifierGate` forks the candidate's immutable Commit ID into a private `verify-*` Branch and runs the verifier there; these private proof Branches are retained because the legacy SDK has no safe delete primitive.
+- `layer.verify` trusts the execution evidence supplied by its caller; the opaque type prevents the wrong result type from reaching `publish`, but it does not independently authenticate arbitrary evidence.
 - `layer.publish()` accepts only `VerifiedCommit`—passing an `UnverifiedCommit` is a compile-time type error (checked by `./scripts/prove_opaque.sh`). This proves the in-process API path, not that arbitrary SDK users or daemon/process failure cannot bypass or interrupt cleanup.
 
 ### 4. Fleet Topologies (`Race` · `MapReduce` · `Portfolio`)
 
 | Topology | Purpose | Termination Condition | Loser / Intermediate Handling |
 | :--- | :--- | :--- | :--- |
-| **`Race`** | Latency hedging across equivalent attempts | First candidate to pass `VerifierGate` | Remaining workers receive cancellation; uncommitted workspace state is discarded after confirmed unmount. |
+| **`Race`** | Latency hedging across equivalent attempts | First candidate to pass `VerifierGate` | Remaining BEAM workers are terminated; uncommitted workspace state is discarded after confirmed unmount. This does not guarantee OS- or remote-request cancellation. |
 | **`MapReduce`** | Parallel execution across orthogonal shards | All shards pass individual verification, merge cleanly, and pass post-merge verification | Shard branches are preserved; merge conflicts abort cleanly with `MergeFailed`. |
 | **`Portfolio`** | Exhaustive evaluation of distinct designs | All candidates finish execution and verification | No early kills; emits a full comparison table and machine-readable `[packet]` JSON. |
 
-### 5. Two-Phase Decision & CAS-Guarded Publish
+### 5. Two-Phase Decision & Candidate-Head CAS Publish
 No topology modifies `main` by default:
 1. **Phase 1 (Explore & Verify)**: Run `portfolio`, `race`, or `map-reduce` to evaluate candidates and receive a structured `[packet]` containing branch names, commit IDs, changed file lists, verification latency, and test output.
-2. **Phase 2 (Decide & Publish)**: The root agent runs `publish <branch> --verify "<cmd>"`, which re-verifies the branch's current head in a fresh workspace, verifies that the branch head did not move during verification (CAS guard), and publishes that exact commit ID to `main`.
+2. **Phase 2 (Decide & Publish)**: The root agent runs `publish <branch> --verify "<cmd>"`, which re-verifies the branch's current head in a fresh workspace, verifies that the candidate/source branch head did not move during verification (CAS guard), and publishes that exact commit ID to `main`. The expected-`main` concurrent-overwrite policy is unchanged.
 
 ---
 

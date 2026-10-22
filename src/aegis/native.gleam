@@ -58,6 +58,9 @@ pub fn file_exists(path: String) -> Bool
 @external(erlang, "aegis_native", "read_file")
 pub fn read_file(path: String) -> Result(BitArray, Nil)
 
+@external(erlang, "aegis_native", "write_file")
+pub fn write_file(path: String, contents: BitArray) -> Result(Nil, Nil)
+
 @external(erlang, "aegis_native", "list_dir")
 pub fn list_dir(path: String) -> List(String)
 

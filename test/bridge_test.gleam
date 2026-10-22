@@ -1,3 +1,5 @@
+import aegis/bridge
+import aegis/config
 import aegis/native
 import aegis/sdk
 import aegis_test_helper
@@ -32,4 +34,23 @@ pub fn bridge_answers_and_traces_fork_test() {
   assert string.contains(trace, "traced-branch")
 
   aegis_test_helper.stop(fleet)
+}
+
+/// A late exit waiter sees the same nonzero bridge exit as the first waiter.
+pub fn late_bridge_exit_waiter_preserves_nonzero_status_test() {
+  let assert Ok(base) = config.load()
+  let config =
+    config.Config(..base, bridge_script: case native.env("PWD") {
+      Ok(root) -> root <> "/test/fixtures/nonzero_exit_bridge.mjs"
+      Error(Nil) -> "test/fixtures/nonzero_exit_bridge.mjs"
+    })
+  let assert Ok(bridge) = bridge.start(config)
+  assert case bridge.shutdown(bridge, 5000) {
+    Error(bridge.BridgeDown(_)) -> True
+    _ -> False
+  }
+  assert case bridge.await_exit(bridge, 5000) {
+    Error(bridge.BridgeDown(_)) -> True
+    _ -> False
+  }
 }

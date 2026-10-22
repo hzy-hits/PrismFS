@@ -66,23 +66,38 @@ function events(control) {
   }
 }
 
-function waitForEvent(control, name, count = 1) {
+function waitForEvent(control, name, count = 1, timeout = 5000) {
   if (events(control).filter((event) => event.event === name).length >= count) {
     return Promise.resolve();
   }
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const watcher = watch(control, () => {
       if (events(control).filter((event) => event.event === name).length >= count) {
         watcher.close();
+        clearTimeout(timer);
         resolve();
       }
     });
+    const timer = setTimeout(() => {
+      watcher.close();
+      reject(new Error(`timed out waiting for ${name}`));
+    }, timeout);
   });
 }
 
 function waitForExit(child) {
   if (child.exitCode !== null) return Promise.resolve(child.exitCode);
   return new Promise((resolve) => child.once("exit", resolve));
+}
+
+function within(promise, label, timeout = 5000) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeout);
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 test("failed unmount remains owned and shutdown retries it", async (t) => {
@@ -96,14 +111,14 @@ test("failed unmount remains owned and shutdown retries it", async (t) => {
   });
   assert.equal(failed.ok, false);
   assert.equal((await bridge.call("shutdown")).ok, true);
-  assert.equal(await waitForExit(bridge.child), 0);
+  assert.equal(await within(waitForExit(bridge.child), "bridge exit"), 0);
   assert.equal(
     events(bridge.control).filter((event) => event.event === "unmount").length,
     2,
   );
 });
 
-test("late mount success can be compensated after caller deadline", async (t) => {
+test("bridge retains a successful mount until explicit cleanup", async (t) => {
   const bridge = start({ BLOCK_MOUNT: "1" });
   t.after(bridge.cleanup);
   const mounting = bridge.call("mount", { branch: "main" });
@@ -116,7 +131,27 @@ test("late mount success can be compensated after caller deadline", async (t) =>
     discard: true,
   })).ok, true);
   assert.equal((await bridge.call("shutdown")).ok, true);
-  assert.equal(await waitForExit(bridge.child), 0);
+  assert.equal(await within(waitForExit(bridge.child), "bridge exit"), 0);
+});
+
+test("overlapping shutdowns share one cleanup pass", async (t) => {
+  const bridge = start({ BLOCK_UNMOUNT: "1" });
+  t.after(bridge.cleanup);
+  assert.equal((await bridge.call("mount", { branch: "main" })).ok, true);
+
+  const first = bridge.call("shutdown");
+  await waitForEvent(bridge.control, "unmount");
+  const second = bridge.call("shutdown");
+  assert.equal((await within(bridge.call("hello"), "closing response")).ok, false);
+  assert.equal(events(bridge.control).filter((event) => event.event === "unmount").length, 1);
+
+  writeFileSync(join(bridge.control, "allow-unmount"), "");
+  const replies = await within(Promise.all([first, second]), "shutdown replies");
+  assert.equal(replies[0].ok, true);
+  assert.equal(replies[1].ok, true);
+  assert.equal(await within(waitForExit(bridge.child), "bridge exit"), 0);
+  assert.equal(events(bridge.control).filter((event) => event.event === "unmount").length, 1);
+  assert.equal(events(bridge.control).filter((event) => event.event === "close").length, 1);
 });
 
 test("EOF waits for an accepted mount then releases it", async (t) => {
@@ -127,7 +162,7 @@ test("EOF waits for an accepted mount then releases it", async (t) => {
   bridge.child.stdin.end();
   assert.equal(bridge.child.exitCode, null);
   writeFileSync(join(bridge.control, "allow-mount"), "");
-  assert.equal(await waitForExit(bridge.child), 0);
+  assert.equal(await within(waitForExit(bridge.child), "bridge exit"), 0);
   assert.equal(events(bridge.control).some((event) => event.event === "mount-success"), true);
   assert.equal(events(bridge.control).some((event) => event.event === "unmount"), true);
 });
@@ -143,5 +178,5 @@ test("shutdown reports failed cleanup and stays alive for retry", async (t) => {
   assert.equal(bridge.child.exitCode, null);
   rmSync(join(bridge.control, "fail-unmount"));
   assert.equal((await bridge.call("shutdown")).ok, true);
-  assert.equal(await waitForExit(bridge.child), 0);
+  assert.equal(await within(waitForExit(bridge.child), "bridge exit"), 0);
 });

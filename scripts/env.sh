@@ -19,7 +19,7 @@ if [ ! -f "$AEGIS_ROOT/priv/bridge_worker.mjs" ]; then
   echo "aegis: $AEGIS_ROOT/priv/bridge_worker.mjs is missing" >&2
   exit 1
 fi
-if [ ! -d "$LAYERFS_DIR/.git" ]; then
+if ! git -C "$LAYERFS_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "aegis: no LayerFS checkout at $LAYERFS_DIR; run scripts/bootstrap-layerfs.sh" >&2
   exit 1
 fi

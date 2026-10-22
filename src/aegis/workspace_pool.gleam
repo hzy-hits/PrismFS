@@ -590,6 +590,10 @@ fn begin_unmount(
     Ok(found) -> found
     Error(Nil) -> lease
   }
+  let discard = case lease.released {
+    Some(previous) -> previous || discard
+    None -> discard
+  }
   start_unmount(state, lease.id, path, discard)
   update_lease(state, lease.id, fn(found) {
     Lease(..found, phase: Releasing(path, discard), released: Some(discard))

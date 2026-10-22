@@ -8,9 +8,9 @@
 
 它将原本交由大模型在 Bash 中手写内联脚本维护的流程替换为确定性控制内核：
 - **进程级 Workspace 租约（Workspace Pool）**：Worker 崩溃、超时或被抢占时触发 `unmount(discard: true)`；只有底层明确确认成功后才归还槽位。
-- **不可变快照验证门禁（Opaque Verification Gate）**：opaque type 禁止把 `UnverifiedCommit` 传给 `layer.publish`；门禁验证精确 Commit ID，最终发布仍依赖 LayerFS CAS。
-- **三大确定性拓扑算子**：内置 **`Race`**（先到先得的协作取消对冲）、**`MapReduce`**（正交分片并行施工与三方自动合并）、以及 **`Portfolio`**（多实现方案全量评估与比选）。
-- **主 Agent 决策主权（Main-Agent Sovereignty）**：所有拓扑默认均不擅自修改 `main`，而是向主 Agent 输出包含分支、Commit、改动文件列表与测试耗时的结构化决策包（Decision Packet），由主 Agent 或用户拍板后通过带 CAS 防篡改校验的 `publish` 显式发布。
+- **不可变快照验证门禁（Opaque Verification Gate）**：opaque type 禁止把 `UnverifiedCommit` 传给 `layer.publish`；门禁验证精确 Commit ID，最终发布校验候选/源分支 Head 的 LayerFS CAS；`main` 的并发覆盖策略保持不变。
+- **三大确定性拓扑算子**：内置 **`Race`**（BEAM Worker 终止并确认清理）、**`MapReduce`**（正交分片并行施工与三方自动合并）、以及 **`Portfolio`**（多实现方案全量评估与比选）。Worker 终止不保证 OS 或远端请求一定取消。
+- **主 Agent 决策主权（Main-Agent Sovereignty）**：所有拓扑默认均不擅自修改 `main`，而是向主 Agent 输出包含分支、Commit、改动文件列表与测试耗时的结构化决策包（Decision Packet），由主 Agent 或用户拍板后通过显式 `publish` 发布。
 
 ---
 
@@ -80,20 +80,21 @@ flowchart LR
 ### 3. 编译期验证门禁 (`aegis/domain/layer`)
 - 任何 Worker 执行命令仅能产出 `UnverifiedCommit`。
 - `VerifiedCommit` 的构造器为模块私有。`VerifierGate` 从候选的不可变 Commit ID 创建私有 `verify-*` Branch 后执行验证；旧版 SDK 没有安全删除原语，因此这些证明 Branch 会保留。
+- `layer.verify` 信任调用方提供的执行证据；opaque type 只阻止错误结果类型进入 `publish`，不会独立认证任意证据。
 - `layer.publish()` 仅接受 `VerifiedCommit`；传入 `UnverifiedCommit` 会产生编译错误，并由 `./scripts/prove_opaque.sh` 检查。该证明只覆盖进程内 API 路径，不代表任意 SDK 调用或 daemon/进程故障都能被内核兜底。
 
 ### 4. 三大并发拓扑算子 (`Race` · `MapReduce` · `Portfolio`)
 
 | 算子 | 适用场景 | 终止条件 | 失败/慢分支处理策略 |
 | :--- | :--- | :--- | :--- |
-| **`Race`** | 同一目标的等价竞速尝试（对冲长尾延迟） | 第一个通过 `VerifierGate` 的分支诞生 | 其余 Worker 收到取消请求；未提交工作区在确认卸载后丢弃，已提交历史保留。 |
+| **`Race`** | 同一目标的等价竞速尝试（对冲长尾延迟） | 第一个通过 `VerifierGate` 的分支诞生 | 其余 BEAM Worker 被终止；未提交工作区在确认卸载后丢弃，已提交历史保留；不保证 OS 或远端请求取消。 |
 | **`MapReduce`** | 正交模块分片并行重构与合流 | 所有分片各自过检 $\rightarrow$ 折叠合并 $\rightarrow$ 合并分支再次过检 | 保留各分片分支；若发生三方合并冲突则安全中止并返回 `MergeFailed`。 |
 | **`Portfolio`** | 不同实现方案的全量对比评估 | 所有候选方案均完成执行与验证 | 不提前强杀任何分支；输出完整对比报表与机器可读的 `[packet]` JSON 决策包。 |
 
-### 5. 两阶段决策与 CAS 防篡改发布
+### 5. 两阶段决策与候选 Head CAS 发布
 内核默认绝不自动改写 `main`：
 1. **第一阶段（并发探索与验证）**：主 Agent 调用 `portfolio`、`race` 或 `map-reduce`，获取包含各候选分支、Commit ID、改动文件列表、验证耗时及测试输出的结构化 `[packet]`。
-2. **第二阶段（拍板与受控发布）**：主 Agent 选定最优分支后调用 `publish <branch> --verify "<cmd>"`。内核在全新工作区中对该分支当前 Head 重新运行验证，并在发布前校验分支 Head 在验证期间未发生移动（CAS 保护），确认无误后将其发布至 `main`。
+2. **第二阶段（拍板与受控发布）**：主 Agent 选定最优分支后调用 `publish <branch> --verify "<cmd>"`。内核在全新工作区中对该分支当前 Head 重新运行验证，并在发布前校验候选/源分支 Head 在验证期间未发生移动（CAS 保护），确认无误后将其发布至 `main`；`main` 的并发覆盖策略保持不变。
 
 ---
 
@@ -139,7 +140,7 @@ usage:
   aegisfleet status                          查看项目、分支列表与当前挂载的工作区
   aegisfleet reap                            安全卸载所有处于 Idle 且干净的残留工作区
   aegisfleet race [--publish] --verify "<cmd>" <name>:<command> ...
-                                             赛马模式：第一个通过验证的分支胜出并请求取消其余分支
+                                             赛马模式：第一个通过验证的分支胜出并终止其余 BEAM Worker、请求清理
   aegisfleet map-reduce [--publish] --verify "<cmd>" <name>:<command> ...
                                              分治模式：多分支并行施工、折叠合并并统一验证
   aegisfleet portfolio --verify "<cmd>" <name>:<command> ...
