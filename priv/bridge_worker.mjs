@@ -15,6 +15,7 @@
 // any change to the Host plugin.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const env = process.env;
@@ -57,15 +58,50 @@ async function loadSdk() {
   return { LayerFS: sdk.LayerFS, Operator };
 }
 
-const { LayerFS, Operator } = await loadSdk();
-const lf = new LayerFS(PROJECT);
+let LayerFS = null;
+let Operator = null;
+let lf = null;
+let sdkCompatibilityError = null;
+try {
+  ({ LayerFS, Operator } = await loadSdk());
+  if (typeof LayerFS !== "function") {
+    throw fail("IncompatibleSDK", "configured SDK does not export LayerFS");
+  }
+  lf = new LayerFS(PROJECT);
+  const required = [
+    ["service", lf],
+    ["project.init", lf.project],
+    ["project.list_branches", lf.project],
+    ["branch.fork", lf.branch],
+    ["branch.publish", lf.branch],
+    ["sandbox.mount", lf.sandbox],
+    ["sandbox.exec", lf.sandbox],
+    ["sandbox.commit", lf.sandbox],
+    ["sandbox.unmount", lf.sandbox],
+  ];
+  const missing = required
+    .filter(([name, owner]) => typeof owner?.[name.split(".").at(-1)] !== "function")
+    .map(([name]) => name);
+  if (missing.length) {
+    throw fail(
+      "IncompatibleSDK",
+      `LayerFS revision lacks the legacy SDK methods PrismFS requires: ${missing.join(", ")}`,
+    );
+  }
+} catch (error) {
+  sdkCompatibilityError = fail(
+    "IncompatibleSDK",
+    error?.message ?? String(error),
+  );
+  log(`${sdkCompatibilityError.code}: ${sdkCompatibilityError.message}`);
+}
 
 /** The simulator's own read model, when this bridge drives a simulated project. */
 let simOperator = null;
 const simClientSpec = env.AEGIS_SIM_CLIENT || (env.AEGIS_SIM === "1" && SDK.includes("/sim/sdk.js")
   ? new URL("./client.js", isAbsolute(SDK) ? pathToFileURL(SDK).href : SDK).href
   : "");
-if (simClientSpec) {
+if (simClientSpec && !sdkCompatibilityError) {
   const entry = isAbsolute(simClientSpec) ? pathToFileURL(simClientSpec).href : simClientSpec;
   const { simClient } = await import(entry);
   simOperator = simClient(HOME, PROJECT).operator;
@@ -108,10 +144,25 @@ function mirrorDshTrace(trace) {
 
 /** Sandboxes this process mounted in, so a lost kernel still cleans up. */
 const mounts = new Map();
+const confirmedReleased = new Set();
 let sandbox = SANDBOX || null;
+let sandboxPromise = null;
 
 async function sandboxId() {
-  if (!sandbox) sandbox = await lf.service();
+  if (sandbox) return sandbox;
+  if (!sandboxPromise) {
+    sandboxPromise = Promise.resolve()
+      .then(() => lf.service())
+      .then((found) => {
+        sandbox = found;
+        return found;
+      })
+      .catch((error) => {
+        sandboxPromise = null;
+        throw error;
+      });
+  }
+  sandbox = await sandboxPromise;
   return sandbox;
 }
 
@@ -146,6 +197,7 @@ const workspacesOf = (snap) =>
 
 const ops = {
   async hello() {
+    if (sdkCompatibilityError) throw sdkCompatibilityError;
     return { project: PROJECT, home: HOME, sandbox: sandbox, pid: process.pid, traceDir: TRACE_DIR };
   },
 
@@ -164,12 +216,24 @@ const ops = {
     return clientFor(trace).branch.fork(name, from);
   },
 
+  async fork_snapshot({ snapshot, trace }) {
+    if (typeof snapshot !== "string" || !snapshot.trim()) {
+      throw fail("NoChanges", "verification requires an immutable commit");
+    }
+    const forked = await clientFor(trace).branch.fork(`verify-${randomUUID()}`, snapshot);
+    if (forked.head !== snapshot) {
+      throw fail("InvalidSnapshot", "verification reference must identify a saved commit, not a branch");
+    }
+    return forked;
+  },
+
   async mount({ branch, trace }) {
     fireFault("mount");
     if (!branch) throw fail("InvalidInput", "mount needs a branch");
     const sb = await sandboxId();
     const path = await clientFor(trace).sandbox.mount(sb, branch);
-    mounts.set(path, { branch, trace: trace ?? null, at: Date.now() });
+    confirmedReleased.delete(path);
+    mounts.set(path, { branch, trace: trace ?? null, sandbox: sb, at: Date.now() });
     return { path, branch, sandbox: sb };
   },
 
@@ -189,13 +253,15 @@ const ops = {
   },
 
   async unmount({ path, discard }) {
+    fireFault("unmount");
     if (!path) throw fail("InvalidInput", "unmount needs path");
-    const sb = await sandboxId();
-    try {
-      return await clientFor(mounts.get(path)?.trace).sandbox.unmount(sb, path, !!discard);
-    } finally {
-      mounts.delete(path);
-    }
+    const owned = mounts.get(path);
+    if (!owned && confirmedReleased.has(path)) return;
+    const sb = owned?.sandbox ?? await sandboxId();
+    const result = await clientFor(owned?.trace).sandbox.unmount(sb, path, !!discard);
+    if (owned) mounts.delete(path);
+    confirmedReleased.add(path);
+    return result;
   },
 
   async status({ path }) {
@@ -217,8 +283,11 @@ const ops = {
   },
 
   async publish({ branch, commit, trace }) {
+    if (typeof commit !== "string" || !commit.trim()) {
+      throw fail("NoChanges", "publish requires an explicit verified commit");
+    }
     fireFault("publish");
-    return clientFor(trace).branch.publish(branch, commit || undefined);
+    return clientFor(trace).branch.publish(branch, commit);
   },
 
   async read({ branch, path }) {
@@ -253,17 +322,20 @@ const ops = {
    */
   async reap({ keep = [] } = {}) {
     const snap = await readModel();
-    const sb = await sandboxId();
     const kept = new Set(keep);
     const reaped = [];
     for (const w of workspacesOf(snap)) {
       const path = w.directory ?? w.path;
       if (kept.has(path)) continue;
-      const status = await lf.sandbox.status(sb, path);
+      const owned = mounts.get(path);
+      const sb = owned?.sandbox ?? await sandboxId();
+      const layer = clientFor(owned?.trace);
+      const status = await layer.sandbox.status(sb, path);
       const clean = !status.overlay?.inodes && !status.overlay?.entries && !status.overlay?.pendingMerge;
       if (status.activity !== "Idle" || !clean) continue;
-      await lf.sandbox.unmount(sb, path);
+      await layer.sandbox.unmount(sb, path);
       mounts.delete(path);
+      confirmedReleased.add(path);
       reaped.push({ path, branch: w.branch });
     }
     return { reaped };
@@ -289,26 +361,104 @@ const ops = {
   },
 
   async shutdown() {
-    setImmediate(() => shutdown(0));
-    return { ok: true };
+    return explicitShutdown();
   },
 };
 
 /** Unmount everything this bridge still holds (except with `keep`). */
 async function releaseMounts() {
-  if (!sandbox) return;
-  for (const [path] of mounts) {
-    try { await lf.sandbox.unmount(sandbox, path, true); } catch { /* daemon may be gone */ }
+  const failures = [];
+  for (const [path, owned] of mounts) {
+    try {
+      await clientFor(owned.trace).sandbox.unmount(owned.sandbox, path, true);
+      mounts.delete(path);
+      confirmedReleased.add(path);
+    } catch (error) {
+      failures.push({
+        path,
+        branch: owned.branch,
+        sandbox: owned.sandbox,
+        error: error?.message ?? String(error),
+      });
+    }
   }
-  mounts.clear();
+  return failures;
+}
+
+let cleanupPromise = null;
+let closePromise = null;
+
+function cleanupMounts() {
+  if (!cleanupPromise) {
+    cleanupPromise = releaseMounts().finally(() => {
+      cleanupPromise = null;
+    });
+  }
+  return cleanupPromise;
+}
+
+function closeLayer() {
+  if (!closePromise) {
+    closePromise = Promise.resolve()
+      .then(() => lf?.close?.())
+      .catch(() => undefined);
+  }
+  return closePromise;
 }
 
 let closing = false;
-async function shutdown(code) {
+let accepting = true;
+let activeOperations = 0;
+let idleWaiters = [];
+
+function operationStarted() {
+  activeOperations++;
+}
+
+function operationFinished() {
+  activeOperations--;
+  if (activeOperations === 0) {
+    for (const resolve of idleWaiters.splice(0)) resolve();
+  }
+}
+
+async function waitForOperations() {
+  if (activeOperations === 0) return;
+  await new Promise((resolve) => idleWaiters.push(resolve));
+}
+
+function unresolvedText(failures) {
+  return failures
+    .map((item) => `${item.path} branch=${item.branch} sandbox=${item.sandbox}: ${item.error}`)
+    .join("; ");
+}
+
+async function explicitShutdown() {
+  accepting = false;
+  await waitForOperations();
+  const failures = await cleanupMounts();
+  if (failures.length) {
+    throw fail("CleanupFailed", `owned mounts remain: ${unresolvedText(failures)}`);
+  }
+  await closeLayer();
+  setImmediate(() => process.exit(0));
+  return { ok: true };
+}
+
+async function terminalShutdown(code, reason) {
   if (closing) return;
   closing = true;
-  try { await releaseMounts(); } catch (error) { log("cleanup failed:", error.message); }
-  try { await lf.close(); } catch { /* already closed */ }
+  accepting = false;
+  await waitForOperations();
+  let delay = 50;
+  for (;;) {
+    const failures = await cleanupMounts();
+    if (!failures.length) break;
+    log(`${reason} cleanup unresolved: ${unresolvedText(failures)}`);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(delay * 2, 5000);
+  }
+  await closeLayer();
   process.exit(code);
 }
 
@@ -332,6 +482,10 @@ async function handle(frame) {
     return;
   }
   const { id, op, args = {} } = request ?? {};
+  if (!accepting && op !== "shutdown") {
+    send({ id, ok: false, error: { code: "Closing", message: "bridge is draining and accepts no new operations" } });
+    return;
+  }
   const trace = request?.trace ?? args.trace;
   const effectiveTrace = trace ?? (args.path ? mounts.get(args.path)?.trace : null);
   const fn = ops[op];
@@ -339,7 +493,10 @@ async function handle(frame) {
     send({ id, ok: false, error: { code: "UnknownMethod", message: `unknown op ${op}` } });
     return;
   }
+  const counted = op !== "shutdown";
+  if (counted) operationStarted();
   try {
+    if (sdkCompatibilityError) throw sdkCompatibilityError;
     const result = await fn({ ...args, trace });
     mirrorDshTrace(effectiveTrace);
     send({ id, ok: true, result: result ?? null });
@@ -347,6 +504,8 @@ async function handle(frame) {
     mirrorDshTrace(effectiveTrace);
     if (op === "mount" && error?.code) log(`mount failed: ${error.code}: ${error.message}`);
     send({ id, ok: false, error: { code: error?.code ?? "Failed", message: error?.message ?? String(error), detail: error?.detail ?? null } });
+  } finally {
+    if (counted) operationFinished();
   }
 }
 
@@ -354,7 +513,7 @@ process.stdin.on("data", (chunk) => {
   buffer = buffer.length ? Buffer.concat([buffer, chunk]) : chunk;
   while (buffer.length >= 4) {
     const length = buffer.readUInt32BE(0);
-    if (length > MAX_FRAME) { log(`frame too large: ${length}`); shutdown(2); return; }
+    if (length > MAX_FRAME) { log(`frame too large: ${length}`); terminalShutdown(2, "invalid frame"); return; }
     if (buffer.length < 4 + length) break;
     const frame = buffer.subarray(4, 4 + length).toString("utf8");
     buffer = buffer.subarray(4 + length);
@@ -363,9 +522,9 @@ process.stdin.on("data", (chunk) => {
   }
 });
 
-process.stdin.on("end", () => { if (inFlight === 0) shutdown(0); else setTimeout(() => shutdown(0), 50); });
-process.on("SIGTERM", () => shutdown(0));
-process.on("SIGINT", () => shutdown(0));
+process.stdin.on("end", () => { terminalShutdown(0, "EOF"); });
+process.on("SIGTERM", () => { terminalShutdown(0, "SIGTERM"); });
+process.on("SIGINT", () => { terminalShutdown(0, "SIGINT"); });
 process.on("uncaughtException", (error) => log("uncaught:", error?.stack ?? String(error)));
 process.on("unhandledRejection", (error) => log("unhandled:", error?.stack ?? String(error)));
 log(`ready project=${PROJECT} home=${HOME} sdk=${SDK}`);

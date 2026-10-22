@@ -10,6 +10,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/option.{type Option, None, Some}
+import gleam/string
 
 pub type Fleet {
   Fleet(
@@ -36,9 +37,41 @@ pub fn start_full(
   fixture: String,
   queue_timeout: Option(Int),
 ) -> Fleet {
+  start_with_sdk(label, max_slots, fixture, queue_timeout, None, None)
+}
+
+pub fn start_controlled(
+  label: String,
+  max_slots: Int,
+  sdk: String,
+  call_timeout: Int,
+) -> Fleet {
+  start_with_sdk(label, max_slots, "", None, Some(sdk), Some(call_timeout))
+}
+
+fn start_with_sdk(
+  label: String,
+  max_slots: Int,
+  fixture: String,
+  queue_timeout: Option(Int),
+  sdk_override: Option(String),
+  call_timeout: Option(Int),
+) -> Fleet {
   let base = case config.load() {
     Ok(found) -> found
     Error(reason) -> fail("config: ", reason)
+  }
+  let resolved_sdk = case sdk_override {
+    Some(sdk) ->
+      case string.starts_with(sdk, "/") {
+        True -> sdk
+        False ->
+          case native.env("PWD") {
+            Ok(root) -> root <> "/" <> sdk
+            Error(Nil) -> sdk
+          }
+      }
+    None -> base.sdk
   }
   let suffix = int.to_string(native.unique())
   let project = label <> "-" <> suffix
@@ -46,7 +79,9 @@ pub fn start_full(
     config.Config(
       ..base,
       project: project,
+      sdk: resolved_sdk,
       max_slots: max_slots,
+      call_timeout: option.unwrap(call_timeout, base.call_timeout),
       queue_timeout: case queue_timeout {
         Some(value) -> value
         None -> base.queue_timeout
@@ -60,7 +95,15 @@ pub fn start_full(
     Ok(Nil) -> Nil
     Error(error) -> fail("hello: ", bridge.error_text(error))
   }
-  case sdk.init(bridge, fixture, config.call_timeout) {
+  let initialized = case fixture {
+    "" -> Ok(Nil)
+    _ ->
+      case sdk.init(bridge, fixture, config.call_timeout) {
+        Ok(_) -> Ok(Nil)
+        Error(error) -> Error(error)
+      }
+  }
+  case initialized {
     Ok(_) -> Nil
     Error(error) -> fail("init: ", bridge.error_text(error))
   }
@@ -77,7 +120,8 @@ fn fail(prefix: String, detail: String) {
 }
 
 pub fn stop(fleet: Fleet) {
-  workspace_pool.stop(fleet.pool)
+  let assert Ok(_) = workspace_pool.stop(fleet.pool)
+  let assert Ok(Nil) = bridge.shutdown(fleet.bridge, fleet.config.call_timeout)
 }
 
 /// Polls `check` every 10ms until it holds or `timeout` ms pass.

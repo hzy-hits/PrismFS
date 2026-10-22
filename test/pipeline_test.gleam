@@ -1,8 +1,10 @@
+import aegis/bridge
 import aegis/domain/layer
 import aegis/native
 import aegis/sdk
 import aegis/topologies/pipeline
 import aegis_test_helper
+import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/string
@@ -253,4 +255,106 @@ pub fn pipeline_exhausted_retries_halts_cleanly_test() {
   let assert Ok(snapshot) = sdk.snapshot(fleet.bridge, 5000)
   assert snapshot.workspaces == []
   aegis_test_helper.stop(fleet)
+}
+
+/// The final no-op Stage verifies GOOD from an immutable fork while another
+/// writer advances the source Branch to BAD. Pipeline publish must honor the
+/// source-head CAS and reject rather than publish either unverified state.
+pub fn pipeline_publish_rejects_branch_advanced_during_verifier_test() {
+  let fleet = aegis_test_helper.start("pipeline-cas", 3)
+  let ready =
+    fleet.config.home <> "/verifier-ready-" <> int.to_string(native.unique())
+  let release =
+    fleet.config.home <> "/verifier-release-" <> int.to_string(native.unique())
+  let writer_done = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      let reached =
+        aegis_test_helper.wait_until(fn() { native.file_exists(ready) }, 5000)
+      case reached {
+        False -> process.send(writer_done, Error("verifier never became ready"))
+        True ->
+          process.send(writer_done, advance_pipeline_branch(fleet, release))
+      }
+    })
+  let verifier =
+    "touch "
+    <> ready
+    <> "; while [ ! -f "
+    <> release
+    <> " ]; do sleep 0.01; done; test $(cat src/value) = GOOD"
+  let opts =
+    pipeline.PipelineOpts(
+      base: "main",
+      branch_prefix: "concurrent",
+      stages: [
+        pipeline.Stage(
+          "write",
+          "printf GOOD > src/value",
+          "test $(cat src/value) = GOOD",
+        ),
+        pipeline.Stage("check", "true", verifier),
+      ],
+      max_retries_per_stage: 0,
+      publish: True,
+      timeout_ms: 30_000,
+      queue_timeout: fleet.config.queue_timeout,
+      exec_timeout: fleet.config.exec_timeout,
+      call_timeout: fleet.config.call_timeout,
+    )
+  let assert Error(reason) = pipeline.run(fleet.bridge, fleet.pool, opts)
+  assert string.contains(reason, "HeadMoved")
+  let assert Ok(Ok(Nil)) = process.receive(writer_done, 5000)
+  case sdk.read_text(fleet.bridge, "main", "/src/value", 5000) {
+    Ok(value) -> {
+      assert value != "BAD"
+    }
+    Error(_) -> Nil
+  }
+  aegis_test_helper.stop(fleet)
+}
+
+fn advance_pipeline_branch(
+  fleet: aegis_test_helper.Fleet,
+  release_path: String,
+) -> Result(Nil, String) {
+  use mounted <- result_text(sdk.mount(
+    fleet.bridge,
+    "concurrent-check-try-1",
+    "writer",
+    5000,
+  ))
+  use _ <- result_text(sdk.exec(
+    fleet.bridge,
+    mounted.path,
+    "printf BAD > src/value",
+    "writer",
+    5000,
+  ))
+  use _ <- result_text(sdk.commit(
+    fleet.bridge,
+    mounted.path,
+    "advance to bad",
+    "writer",
+    5000,
+  ))
+  use _ <- result_text(sdk.exec(
+    fleet.bridge,
+    mounted.path,
+    "touch " <> release_path,
+    "writer",
+    5000,
+  ))
+  use _ <- result_text(sdk.unmount(fleet.bridge, mounted.path, True, 5000))
+  Ok(Nil)
+}
+
+fn result_text(
+  value: Result(a, bridge.Error),
+  next: fn(a) -> Result(b, String),
+) -> Result(b, String) {
+  case value {
+    Ok(found) -> next(found)
+    Error(error) -> Error(bridge.error_text(error))
+  }
 }

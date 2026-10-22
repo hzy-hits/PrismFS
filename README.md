@@ -7,10 +7,10 @@
 **PrismFS** (`aegisfleet`) is a deterministic, fault-tolerant multi-agent fleet control plane written in **Gleam (Erlang/OTP 28)** on top of **[LayerFS](layerfs)**.
 
 It replaces fragile, prompt-driven shell orchestration (`mount → exec → commit → unmount` loops and manual workspace garbage collection) with a strongly-typed OTP supervision and scheduling kernel:
-- **Process-bound RAII Workspace Leases**: Automatic `unmount(discard: true)` when an agent worker crashes, times out, or is preempted.
-- **Compile-Time Verification Gate**: Opaque `UnverifiedCommit` and `VerifiedCommit` types guarantee at compile time that untested code can never be published to `main`.
-- **Deterministic Fleet Topologies**: First-class `Race` (latency hedging with sub-millisecond preemption), `MapReduce` (parallel sharded execution with automated 3-way merge), and `Portfolio` (exhaustive multi-strategy evaluation).
-- **Main-Agent Sovereignty**: Topologies never mutate `main` behind the caller's back. They emit structured decision packets so the root agent (or human operator) retains final authority via CAS-guarded `publish`.
+- **Process-bound Workspace Leases**: A crashed, timed-out, or preempted worker triggers cleanup; the slot stays owned until `unmount` is confirmed.
+- **Snapshot Verification Gate**: Opaque types prevent callers from passing an `UnverifiedCommit` to `layer.publish`; the gate runs against the exact immutable Commit ID and publish checks the candidate/source head with LayerFS CAS. The expected-`main` concurrent-overwrite policy is unchanged.
+- **Deterministic Fleet Topologies**: First-class `Race` (latency hedging with BEAM worker termination and confirmed cleanup), `MapReduce` (parallel sharded execution with automated 3-way merge), and `Portfolio` (exhaustive multi-strategy evaluation). Worker termination does not guarantee cancellation of OS- or remote-owned requests.
+- **Main-Agent Sovereignty**: Topologies never mutate `main` behind the caller's back. They emit structured decision packets so the root agent (or human operator) retains final authority via explicit `publish`.
 
 ---
 
@@ -70,28 +70,31 @@ flowchart LR
 | :--- | :--- |
 | **All 16 slots in use** | Checkouts enter a FIFO queue with per-waiter deadline (`QueueTimeout`). |
 | **`Busy` / `Capacity` refusal** | Slot remains reserved; retries automatically with exponential backoff (`200ms → 400ms → 800ms…`, capped at `5s`). |
-| **Worker crash or preemption** | Dedicated watcher receives Erlang `DOWN` signal $\rightarrow$ triggers `unmount(path, discard: true)` $\rightarrow$ reclaims slot immediately. |
-| **Worker killed while mount in flight** | Lease is marked `released`; as soon as the in-flight mount resolves, it is immediately unmounted and discarded. |
+| **Worker crash or preemption** | Dedicated watcher receives Erlang `DOWN` and requests `unmount(path, discard: true)`; the slot is reclaimed only after confirmed success. |
+| **Worker killed while mount in flight** | Lease is marked `released`; when the in-flight mount resolves, the path is unmounted and discarded before ownership is released. |
+| **Unknown mount/unmount result** | The slot remains quarantined with its owner, path/intent (when known), and error. No parallel retry is launched for an uncertain operation. |
+| **Shutdown** | Drain rejects new/queued work and waits for late mount replies and cleanup retries. A deadline reports outstanding ownership instead of claiming success. |
 | **Orphaned mounts** | `reap` inspects all sandbox workspaces and safely unmounts only `Idle` workspaces with zero uncommitted overlay changes. |
 | **Stale lease TTL** | Periodic sweep reclaims active leases exceeding `lease_ttl_ms`. |
 
 ### 3. Compile-Time Verification Gate (`aegis/domain/layer`)
 - Worker execution produces only an opaque `UnverifiedCommit`.
-- The constructor for `VerifiedCommit` is private to `aegis/domain/layer` and can only be instantiated by `verify()` when the verifier command exits with `0` inside a clean, isolated Workspace.
-- `layer.publish()` accepts only `VerifiedCommit`—passing an `UnverifiedCommit` is a compile-time type error (verified continuously via `./scripts/prove_opaque.sh`).
+- The constructor for `VerifiedCommit` is private to `aegis/domain/layer`. `VerifierGate` forks the candidate's immutable Commit ID into a private `verify-*` Branch and runs the verifier there; these private proof Branches are retained because the legacy SDK has no safe delete primitive.
+- `layer.verify` trusts the execution evidence supplied by its caller; the opaque type prevents the wrong result type from reaching `publish`, but it does not independently authenticate arbitrary evidence.
+- `layer.publish()` accepts only `VerifiedCommit`—passing an `UnverifiedCommit` is a compile-time type error (checked by `./scripts/prove_opaque.sh`). This proves the in-process API path, not that arbitrary SDK users or daemon/process failure cannot bypass or interrupt cleanup.
 
 ### 4. Fleet Topologies (`Race` · `MapReduce` · `Portfolio`)
 
 | Topology | Purpose | Termination Condition | Loser / Intermediate Handling |
 | :--- | :--- | :--- | :--- |
-| **`Race`** | Latency hedging across equivalent attempts | First candidate to pass `VerifierGate` | Remaining workers are killed in `<1ms`; uncommitted workspace state is discarded. |
+| **`Race`** | Latency hedging across equivalent attempts | First candidate to pass `VerifierGate` | Remaining BEAM workers are terminated; uncommitted workspace state is discarded after confirmed unmount. This does not guarantee OS- or remote-request cancellation. |
 | **`MapReduce`** | Parallel execution across orthogonal shards | All shards pass individual verification, merge cleanly, and pass post-merge verification | Shard branches are preserved; merge conflicts abort cleanly with `MergeFailed`. |
 | **`Portfolio`** | Exhaustive evaluation of distinct designs | All candidates finish execution and verification | No early kills; emits a full comparison table and machine-readable `[packet]` JSON. |
 
-### 5. Two-Phase Decision & CAS-Guarded Publish
+### 5. Two-Phase Decision & Candidate-Head CAS Publish
 No topology modifies `main` by default:
 1. **Phase 1 (Explore & Verify)**: Run `portfolio`, `race`, or `map-reduce` to evaluate candidates and receive a structured `[packet]` containing branch names, commit IDs, changed file lists, verification latency, and test output.
-2. **Phase 2 (Decide & Publish)**: The root agent runs `publish <branch> --verify "<cmd>"`, which re-verifies the branch's current head in a fresh workspace, verifies that the branch head did not move during verification (CAS guard), and publishes that exact commit ID to `main`.
+2. **Phase 2 (Decide & Publish)**: The root agent runs `publish <branch> --verify "<cmd>"`, which re-verifies the branch's current head in a fresh workspace, verifies that the candidate/source branch head did not move during verification (CAS guard), and publishes that exact commit ID to `main`. The expected-`main` concurrent-overwrite policy is unchanged.
 
 ---
 
@@ -100,12 +103,16 @@ No topology modifies `main` by default:
 ### Prerequisites
 - **Erlang/OTP** $\ge$ 28
 - **Gleam** $\ge$ 1.14
-- **Node.js** $\ge$ 22
-- **LayerFS** checkout linked at [`./layerfs`](layerfs) (or specified via `LAYERFS_DIR`)
+- **Node.js** $\ge$ 22.19
+- **LayerFS** at pinned revision recorded in [`layerfs.revision`](layerfs.revision)
 
 ### Build & Verify
 
 ```bash
+# Fetch the compatible legacy simulator SDK and install its workspace packages.
+# LAYERFS_DIR may name a separate checkout; an existing checkout is never moved.
+./scripts/bootstrap-layerfs.sh
+
 # 1. Build standalone escript executable (./aegisfleet)
 ./scripts/build.sh
 
@@ -120,6 +127,13 @@ No topology modifies `main` by default:
 ./aegisfleet demo-map-reduce priv/fixture_mr
 ./scripts/prove_opaque.sh
 ```
+
+`scripts/env.sh` verifies the exact LayerFS revision before running. A newer
+LayerFS `main` uses the Workspace API and is intentionally rejected rather than
+silently exercised through incompatible legacy `sandbox.mount/exec/commit/unmount`
+methods. Graceful drain can be delayed by an uncancellable SDK call; force-kill
+recovery and cleanup after daemon or bridge process death are outside this
+kernel's guarantees.
 
 ### CLI Reference
 

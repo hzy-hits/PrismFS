@@ -19,6 +19,7 @@
     priv_dir/1,
     file_exists/1,
     read_file/1,
+    write_file/2,
     list_dir/1
 ]).
 
@@ -150,5 +151,11 @@ file_exists(Path) ->
 read_file(Path) ->
     case file:read_file(unicode:characters_to_list(Path)) of
         {ok, Bin} -> {ok, Bin};
+        {error, _} -> {error, nil}
+    end.
+
+write_file(Path, Contents) ->
+    case file:write_file(unicode:characters_to_list(Path), Contents) of
+        ok -> {ok, nil};
         {error, _} -> {error, nil}
     end.

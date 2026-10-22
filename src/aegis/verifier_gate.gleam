@@ -1,4 +1,4 @@
-//// The VerifierGate: mounts the candidate Branch in a throwaway Workspace,
+//// The VerifierGate: forks the exact candidate Commit into a private Branch,
 //// runs the check command, and returns a VerifiedCommit only on exit 0.
 
 import aegis/bridge
@@ -7,6 +7,7 @@ import aegis/native
 import aegis/sdk
 import aegis/workspace_pool
 import gleam/erlang/process
+import gleam/result
 
 pub fn verify(
   bridge: bridge.Bridge,
@@ -18,10 +19,21 @@ pub fn verify(
   exec_timeout: Int,
 ) -> Result(layer.VerifiedCommit, layer.VerificationError) {
   let started = native.monotonic_ms()
+  use snapshot_branch <- result.try(
+    sdk.fork_snapshot(
+      bridge,
+      layer.commit_id(candidate),
+      verifier_name,
+      queue_timeout,
+    )
+    |> result.map_error(fn(error) {
+      layer.CannotVerify(bridge.error_text(error))
+    }),
+  )
   case
     workspace_pool.checkout(
       pool,
-      layer.branch(candidate),
+      snapshot_branch.branch,
       verifier_name,
       verifier_name,
       queue_timeout,

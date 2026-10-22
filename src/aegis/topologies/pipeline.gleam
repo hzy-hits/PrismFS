@@ -269,14 +269,9 @@ fn attempt_stage(
   {
     worker_runner.Produced(commit) -> gate(bridge, pool, opts, stage, commit)
     worker_runner.CommittedNothing(head) -> {
-      // An idempotent Stage may legitimately change nothing (its Branch
-      // already holds the output, e.g. a re-run or a Stage that only asserts).
-      // The Branch head is still the clean snapshot the command ran on, so the
-      // Stage gate can judge it; the Commit id is empty because no new Commit
-      // exists, and `publish` falls back to the Branch head. Failing the Stage
-      // here instead would turn "already satisfied" into an error the caller
-      // cannot fix.
-      let commit = layer.unverified(branch, "", head, stage.name, stage.command)
+      // No new commit still inherits the previous stage's immutable snapshot.
+      let commit =
+        layer.unverified(branch, head, head, stage.name, stage.command)
       gate(bridge, pool, opts, stage, commit)
     }
     other -> Error(worker_runner.outcome_text(other))
@@ -306,14 +301,9 @@ fn gate(
   }
 }
 
-/// The parent of the next Stage: the Commit the gate verified. When a Stage
-/// changed nothing there is no commit id, so the verified Branch itself (whose
-/// head is that same clean parent) is the ref.
+/// The parent of the next Stage is always the immutable Commit verified.
 fn next_ref(verified: layer.VerifiedCommit) -> String {
-  case layer.verified_commit_id(verified) {
-    "" -> layer.verified_branch(verified)
-    id -> id
-  }
+  layer.verified_commit_id(verified)
 }
 
 fn finish(
