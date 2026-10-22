@@ -31,6 +31,16 @@ The integration targets DSH source revision
 installation using another revision needs the real-composition test repeated.
 Run the opt-in simulator composition test from PrismFS after building its CLI:
 `DSH_DIR=/home/ubuntu/repos/deepseek-harness ./scripts/test-dsh-runtime.sh`.
+The test requires a prepared pinned DSH checkout, Node/pnpm and Erlang/escript,
+not the Gleam compiler. To test a prebuilt artifact, set `PRISMFS_BINARY` and
+`DSH_LAYERFS_SDK` to absolute paths; the SDK must be the compatible simulator
+distribution, including its sibling `client.js`. This bypasses the separate
+LayerFS checkout requirement. Without an explicit SDK (`DSH_LAYERFS_SDK` or
+`AEGIS_SDK`), the script uses the pinned simulator under `LAYERFS_DIR` (default:
+the sibling `layerfs` checkout). It never installs or builds dependencies.
+`DSH_LAYERFS_HOME` takes precedence over `AEGIS_HOME`; if neither is supplied,
+the script creates and removes a private temporary home. A supplied home is
+retained. `DSH_LAYERFS_PROJECT` is honored, or defaults to a per-process test name.
 It uses the pinned DSH Vitest configuration and test-only AgentLoop composition;
 it starts child sessions through the real in-process spawn provider and
 SubagentRuntime, with a scripted model boundary. The test also parses this
