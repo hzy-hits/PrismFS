@@ -33,8 +33,14 @@ Run the opt-in simulator composition test from PrismFS after building its CLI:
 `DSH_DIR=/home/ubuntu/repos/deepseek-harness ./scripts/test-dsh-runtime.sh`.
 It uses the pinned DSH Vitest configuration and test-only AgentLoop composition;
 it starts child sessions through the real in-process spawn provider and
-SubagentRuntime, with a scripted model boundary. It does not boot the profile
-through Loader or exercise a parent model selecting the native subagent tool.
+SubagentRuntime, with a scripted model boundary. The test also parses this
+shipped preset through a real Cordis Loader tree, registers the DSH host
+services from source as Loader builtins, resolves the actual
+`file:///.../integration/dsh-plugin.mjs`, mounts the preset on a parent, and
+checks inherited child scope and disposal. This source-host composition is
+intentionally narrower than qualification of the full deployed headless
+profile; it does not claim production profile or Live Docker coverage, and it
+does not exercise a parent model selecting the native subagent tool.
 
 ## Ownership and results
 
@@ -105,5 +111,8 @@ DSH_DIR=/home/ubuntu/repos/deepseek-harness ./scripts/test-dsh-runtime.sh
 ```
 
 The opt-in runtime test exercises real AgentLoop child sessions, the in-process
-spawn provider, and the actual PrismFS tool against the LayerFS simulator. It
-does not claim Loader/profile composition or Live Docker qualification.
+spawn provider, the actual PrismFS tool, and the shipped scoped preset through
+the Loader against the LayerFS simulator. Its test-only Loader host registers
+the pinned DSH source modules as builtins so the preset's production file
+namespace is resolved without installing a deployed profile. It does not claim
+full headless-profile or Live Docker qualification.

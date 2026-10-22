@@ -103,13 +103,15 @@ pub fn failed_commands_still_checkpoint_and_timeout_settles_test() {
 
 pub fn late_commit_keeps_lease_until_definitive_reply_test() {
   let fleet =
-    aegis_test_helper.start_controlled(
+    aegis_test_helper.start_controlled_with_ttl(
       "late-commit",
       1,
       "test/fixtures/controlled_sdk.mjs",
       75,
+      0,
     )
   let control = fleet.config.home <> "/" <> fleet.config.project
+  assert fleet.config.lease_ttl_ms == 0
   let result = process.new_subject()
   process.spawn_unlinked(fn() {
     process.send(
@@ -137,6 +139,17 @@ pub fn late_commit_keeps_lease_until_definitive_reply_test() {
     },
     5000,
   )
+  assert aegis_test_helper.stats(fleet).in_use == 1
+  assert case native.read_file(control <> "/events.jsonl") {
+    Ok(bytes) ->
+      !string.contains(
+        bit_array.to_string(bytes) |> result.unwrap(""),
+        "\"event\":\"unmount\"",
+      )
+    Error(Nil) -> True
+  }
+  process.sleep(1200)
+  let assert Error(Nil) = process.receive(result, 0)
   assert aegis_test_helper.stats(fleet).in_use == 1
   assert case native.read_file(control <> "/events.jsonl") {
     Ok(bytes) ->
