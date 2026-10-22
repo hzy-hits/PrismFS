@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, watch } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync, watch } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -179,4 +179,45 @@ test("shutdown reports failed cleanup and stays alive for retry", async (t) => {
   rmSync(join(bridge.control, "fail-unmount"));
   assert.equal((await bridge.call("shutdown")).ok, true);
   assert.equal(await within(waitForExit(bridge.child), "bridge exit"), 0);
+});
+
+test("step emits no success JSON when its cleanup deadline expires", async (t) => {
+  const binary = join(root, "aegisfleet");
+  if (!existsSync(binary)) return t.skip("build aegisfleet before running the CLI cleanup regression");
+  const control = mkdtempSync(join(tmpdir(), "prismfs-step-cleanup-"));
+  writeFileSync(join(control, "fail-unmount"), "");
+  const child = spawn(binary, ["step", "cleanup-branch", "main", "printf x > src/value"], {
+    env: {
+      ...process.env,
+      AEGIS_HOME: control,
+      AEGIS_PROJECT: "cleanup-cli",
+      AEGIS_SDK: fixture,
+      AEGIS_BRIDGE: worker,
+      AEGIS_CALL_TIMEOUT: "50",
+      AEGIS_MOUNT_BACKOFF: "200",
+      CONTROL_DIR: control,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (part) => { stdout += part; });
+  t.after(async () => {
+    rmSync(join(control, "fail-unmount"), { force: true });
+    if (child.exitCode === null) child.kill("SIGTERM");
+    await within(waitForExit(child), "CLI test child exit");
+    if (!events(control).some((event) => event.event === "close")) {
+      await within(waitForEvent(control, "close"), "terminal bridge cleanup");
+    }
+    rmSync(control, { recursive: true, force: true });
+  });
+
+  await within(waitForEvent(control, "unmount"), "failed step unmount");
+  const exitCode = await within(waitForExit(child), "failed CLI step");
+  assert.notEqual(exitCode, 0);
+  assert.equal(stdout.trim(), "");
+
+  rmSync(join(control, "fail-unmount"));
+  await within(waitForEvent(control, "close"), "terminal bridge cleanup");
+  assert.equal(events(control).filter((event) => event.event === "unmount").length >= 2, true);
 });

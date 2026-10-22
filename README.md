@@ -16,6 +16,7 @@ It replaces fragile, prompt-driven shell orchestration (`mount → exec → comm
 
 ## Documentation
 
+- **[Native DSH integration](docs/DSH.md)**: Keep DSH's native spawn/model loop; route session-bound Bash steps through Gleam and LayerFS without a new daemon.
 - **[Architecture & Engineering Design (`docs/DESIGN.md`)](docs/DESIGN.md)**: System architecture, OTP actor state machines, opaque type gates, and zero-intrusion DSH runtime integration.
 - **[Multi-Agent Parallel Implementation Spec (`docs/AGENT_FLEET_SPEC.md`)](docs/AGENT_FLEET_SPEC.md)**: Orthogonal workpack specification (`Workpacks A ~ E`) and master dispatch prompt for autonomous multi-agent implementation in DSH.
 - **[User Acceptance Testing (`docs/UAT.md`)](docs/UAT.md)**: 30 automated end-to-end acceptance checks (`./scripts/uat.sh`) and 19 kernel unit tests.

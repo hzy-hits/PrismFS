@@ -713,8 +713,10 @@ fn sweep(state: State) -> State {
   let state =
     list.fold(state.active, state, fn(current, lease) {
       case lease.phase {
-        Active(_) if now - lease.started > state.config.lease_ttl_ms ->
-          release_lease(current, lease.id, True, True)
+        Active(_)
+          if state.config.lease_ttl_ms > 0
+          && now - lease.started > state.config.lease_ttl_ms
+        -> release_lease(current, lease.id, True, True)
         _ -> current
       }
     })

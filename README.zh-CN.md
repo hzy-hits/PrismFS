@@ -1,5 +1,7 @@
 # PrismFS
 
+**[DSH 最小接入](docs/DSH.md)**：保留原生 spawn 和多轮模型循环，按会话绑定分支，每次 Bash 调用经 Gleam 管理临时 Workspace；不新增 daemon。
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 > **将单条主干意图折射为 BEAM 上的 $N$ 条并行 LayerFS 分支，并将通过验证的胜出方案重新聚焦回 `main`。**

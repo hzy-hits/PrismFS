@@ -37,7 +37,7 @@ pub fn start_full(
   fixture: String,
   queue_timeout: Option(Int),
 ) -> Fleet {
-  start_with_sdk(label, max_slots, fixture, queue_timeout, None, None)
+  start_with_sdk(label, max_slots, fixture, queue_timeout, None, None, None)
 }
 
 pub fn start_controlled(
@@ -46,7 +46,33 @@ pub fn start_controlled(
   sdk: String,
   call_timeout: Int,
 ) -> Fleet {
-  start_with_sdk(label, max_slots, "", None, Some(sdk), Some(call_timeout))
+  start_with_sdk(
+    label,
+    max_slots,
+    "",
+    None,
+    Some(sdk),
+    Some(call_timeout),
+    None,
+  )
+}
+
+pub fn start_controlled_with_ttl(
+  label: String,
+  max_slots: Int,
+  sdk: String,
+  call_timeout: Int,
+  lease_ttl_ms: Int,
+) -> Fleet {
+  start_with_sdk(
+    label,
+    max_slots,
+    "",
+    None,
+    Some(sdk),
+    Some(call_timeout),
+    Some(lease_ttl_ms),
+  )
 }
 
 fn start_with_sdk(
@@ -56,6 +82,7 @@ fn start_with_sdk(
   queue_timeout: Option(Int),
   sdk_override: Option(String),
   call_timeout: Option(Int),
+  lease_ttl_ms: Option(Int),
 ) -> Fleet {
   let base = case config.load() {
     Ok(found) -> found
@@ -86,6 +113,7 @@ fn start_with_sdk(
         Some(value) -> value
         None -> base.queue_timeout
       },
+      lease_ttl_ms: option.unwrap(lease_ttl_ms, base.lease_ttl_ms),
     )
   let bridge = case bridge.start(config) {
     Ok(found) -> found

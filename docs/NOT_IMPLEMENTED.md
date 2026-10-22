@@ -43,33 +43,31 @@
 
 ---
 
-## 2. DSH 宿主集成（M4，已实现未验证）
+## 2. DSH 宿主集成
 
 ### 2.1 当前状态
 
-- Workpack A 已把 DSH 宿主侧改动写进 `layerfs` checkout：
-  - `packages/host/src/env.js`：会话绑定项目且存在 `AEGIS_FLEET_BIN`/`DSH_LAYERFS_FLEET` 时，运行时上下文注入**自发编排规则**（portfolio / map-reduce / race / run / publish / reap）+ 子 Agent 专属分支名；
-  - `packages/host/src/lfs.js`：抽出 `runFleet`，并把 `portfolio`、`race`、`map-reduce`、`publish`、`reap` 注册为顶层命令（等同 `lfs fleet <cmd>`）；
-  - `packages/host/src/fleet-provider.js`：原生 `subagent` 的 `fleet` provider——启动前 fork `sub-<id>`、执行中注入分支、`AbortSignal`/Stop 触发 `fleet reap`、结束时把 `diff(main, sub-<id>)` 摘要附在结果里，**从不自动 publish**；
-  - `packages/host/src/index.js`：`ctx.inject(['subagents'])` 注册该 provider；
-  - `packages/dsh-layerfs/presets/layerfs-dsh-minimalist.patch.yml`：fleet 宿主配置与 persona 指引。
-- `packages/host/tests/host.mjs` 的 `projectContext` 断言已同步（多行上下文）。
-- 已通过 `node --check`、YAML 解析、`node tests/host.mjs`（`host: ok`）、以及真实 `lfs.js` 冒烟（`status` 正常；顶层 `reap` 确认转发进 `aegisfleet`）。
-- **但仍是「已实现未验证」**：当前运行的 DSH 进程在改动前启动，没有做端到端 subagent 派生实测。
-- 重要限制：`fleet-provider.js` 实现的是**外部后端**（`start`）；默认 preset 的 `provider` 仍是内置 `spawn`（本地 continuable）。要启用需要把 `tool-subagent` 的 `provider` 改成 `fleet`，并保证宿主另有带 `start` 的外部后端（如 dsh-sdk/acp）或给 `createFleetProvider` 注入 `delegate`，否则子 Agent 会不可用。
+- 当前接入是仓库内的 `integration/dsh-plugin.mjs` 和独立 preset，见
+  [安装、生命周期和验收边界](DSH.md)。保留 DSH 原生 `spawn`，不替换 provider。
+- 每个 DSH session 绑定独立 Branch，Bash 经过 `fleet step` 和已有 pool/bridge；
+  每次调用使用临时 Workspace。非零命令退出也提交实际修改，结果不自动发布。
+- 旧 Workpack 文档曾描述外部 checkout 的 `fleet-provider.js`，但固定的 LayerFS
+  checkout 不含它；不能把那份历史描述当成本仓库的可安装实现。
 
 ### 2.2 仍缺少的部分
 
-1. `ctx.effect(ensureFleetDaemon(spec))`：`dsh web` 生命周期托管 `fleet` 守护进程（G-02）。
-2. 子 Agent 结果的 `branch/commit/diff/verifier` 仍以文本摘要回传；没有结构化结果通道。
-3. GUI 卡片/分支树的真机验证（G-03）。
+1. 即时中止在途远程命令、跨 CLI 共享容量和强杀后的持久化恢复。不以新增 daemon
+   作为多轮 agent 的前提；未决操作继续等待，不能把超时当成资源消失。
+2. 工具值含结构化 Branch/Commit；原生子 agent 完成消息仍是 DSH 的 assistant
+   output，没有新增完成结果协议。验证/发布仍由独立的现有入口执行。
+3. Live Docker、GUI 卡片/分支树和真实模型调用的产品验收。
 
 ### 2.3 关闭条件
 
-- 重启 `dsh web` 后用自然语言触发一次 portfolio；
-- Work 面板出现具名 agent 卡片、History 面板出现候选分支；
-- 用户点 Stop 后 1s 内 `snapshot.workspaces=[]`；
-- 子 Agent 的结果不自动发布，主 Agent 能看到决策包。
+- 两个原生 DSH 子 agent 在同一项目各跑多轮工具调用，分支稳定且互不混写；
+- Stop 后停止新调用，在途调用结束/超时后确认清理；不承诺 1 秒内回收；
+- 无变更调用保持快照身份，清理失败不返回成功，候选不自动发布；
+- 区分 mock 模型的真实运行时集成、LayerFS 模拟器与 Live 产品验收。
 
 ## 3. Live / Docker 模式（已实现未验证）
 
