@@ -78,6 +78,7 @@ pub type Msg {
 
 type Phase {
   Mounting
+  MountRetryWait
   MountUnknownState(error: bridge.Error)
   Active(path: String)
   Releasing(path: String, discard: Bool)
@@ -524,7 +525,7 @@ fn definitive_mount_failure(
           process.send_after(state.self, delay, RetryMount(lease.id)) |> ignore
           State(
             ..update_lease(state, lease.id, fn(found) {
-              Lease(..found, phase: Mounting, retries: found.retries + 1)
+              Lease(..found, phase: MountRetryWait, retries: found.retries + 1)
             }),
             retries: state.retries + 1,
           )
@@ -539,16 +540,13 @@ fn definitive_mount_failure(
 
 fn retry_mount(state: State, id: Int) -> State {
   case find_lease(state.active, id) {
-    Ok(Lease(phase: Mounting, released: None, ..) as lease) -> {
+    Ok(Lease(phase: MountRetryWait, released: None, ..) as lease) -> {
+      let state =
+        update_lease(state, id, fn(found) { Lease(..found, phase: Mounting) })
       start_mount(state, lease)
       state
     }
-    Ok(lease) ->
-      case lease.released {
-        Some(_) -> drop_lease(state, id)
-        None -> state
-      }
-    Error(Nil) -> state
+    _ -> state
   }
 }
 
@@ -570,6 +568,7 @@ fn release_lease(state: State, id: Int, discard: Bool, reclaim: Bool) -> State {
         })
       case lease.phase {
         Active(path) -> begin_unmount(state, lease, path, discard)
+        MountRetryWait -> drop_lease(state, id)
         Mounting -> state
         MountUnknownState(_) -> state
         Releasing(_, _) -> state
@@ -742,7 +741,7 @@ fn begin_drain(
     ])
   list.fold(state.active, state, fn(current, lease) {
     case lease.phase {
-      Mounting -> process.send(lease.reply, Error(PoolStopped))
+      Mounting | MountRetryWait -> process.send(lease.reply, Error(PoolStopped))
       _ -> Nil
     }
     release_lease(current, lease.id, True, True)

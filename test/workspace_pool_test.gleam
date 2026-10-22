@@ -1,4 +1,5 @@
 import aegis/bridge
+import aegis/config
 import aegis/native
 import aegis/sdk
 import aegis/workspace_pool
@@ -136,6 +137,77 @@ fn bridge_faults(fleet: aegis_test_helper.Fleet) -> Result(Nil, bridge.Error) {
     decode.success(Nil),
     5000,
   )
+}
+
+fn start_mount_backoff(label: String) -> aegis_test_helper.Fleet {
+  let fleet = aegis_test_helper.start(label, 1)
+  let assert Ok(_) = workspace_pool.stop(fleet.pool)
+  let config = config.Config(..fleet.config, mount_backoff_ms: 5000)
+  let assert Ok(pool) = workspace_pool.start(fleet.bridge, config)
+  let fleet = aegis_test_helper.Fleet(..fleet, config: config, pool: pool)
+  let assert Ok(_) = sdk.fork(fleet.bridge, "backoff", "main", "test", 5000)
+  let assert Ok(_) =
+    bridge.call_json(
+      fleet.bridge,
+      "faults",
+      [
+        #("op", json.string("mount")),
+        #("code", json.string("Busy")),
+        #("times", json.int(1)),
+      ],
+      decode.success(Nil),
+      5000,
+    )
+  fleet
+}
+
+pub fn worker_death_during_mount_backoff_frees_capacity_test() {
+  let fleet = start_mount_backoff("cancel-backoff")
+  let events = process.new_subject()
+  let worker =
+    aegis_test_helper.stuck_worker(fleet, "backoff", "cancelled", events)
+  assert aegis_test_helper.wait_until(
+    fn() { aegis_test_helper.stats(fleet).retries == 1 },
+    1000,
+  )
+  let next = process.new_subject()
+  process.send(
+    fleet.pool,
+    workspace_pool.Checkout(process.self(), "next", "backoff", "test", next),
+  )
+  assert aegis_test_helper.stats(fleet).queued == 1
+  process.kill(worker)
+  let assert Ok(Ok(lease)) = process.receive(next, 1000)
+  assert aegis_test_helper.stats(fleet).in_use == 1
+  assert aegis_test_helper.stats(fleet).unmounted == 0
+  // The cancelled lease was the first allocation; its delayed timer is inert.
+  process.send(fleet.pool, workspace_pool.RetryMount(1))
+  assert aegis_test_helper.stats(fleet).granted == 1
+  let assert Ok(snapshot) = sdk.snapshot(fleet.bridge, 5000)
+  let assert [workspace] = snapshot.workspaces
+  assert workspace.path == lease.path
+  workspace_pool.release(fleet.pool, lease.id, True)
+  aegis_test_helper.stop(fleet)
+}
+
+pub fn drain_during_mount_backoff_drops_empty_lease_test() {
+  let fleet = start_mount_backoff("drain-backoff")
+  let reply = process.new_subject()
+  process.send(
+    fleet.pool,
+    workspace_pool.Checkout(process.self(), "waiting", "backoff", "test", reply),
+  )
+  assert aegis_test_helper.wait_until(
+    fn() { aegis_test_helper.stats(fleet).retries == 1 },
+    1000,
+  )
+  let assert Ok(stats) = workspace_pool.drain(fleet.pool, 1000)
+  assert stats.in_use == 0
+  assert stats.unmounted == 0
+  assert process.receive(reply, 1000) == Ok(Error(workspace_pool.PoolStopped))
+  let assert Ok(snapshot) = sdk.snapshot(fleet.bridge, 5000)
+  assert snapshot.workspaces == []
+  let assert Ok(Nil) = bridge.shutdown(fleet.bridge, 5000)
 }
 
 /// A queued checkout owns a timer: even if no slot ever frees, the pool
